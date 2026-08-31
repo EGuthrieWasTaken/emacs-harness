@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""eh -- thin client for the emacs-harness control surface (DESIGN.md §6.1).
+
+Does no work itself: builds a JSON request, ships it to `ehd` over the
+configured transport, prints the response, and exits with a code the
+caller can branch on without parsing prose.
+
+  0 success    1 assertion/scenario failure    2 usage error
+  3 timeout    4 Emacs signalled an error       5 session unreachable/dead
+
+Transport is chosen by $EH_TRANSPORT (local|docker|ssh), default "docker"
+outside a container / "local" when EH_SOCK is reachable directly. See
+~/.config/eh/config (INI-style: [eh] transport=..., host=..., container=...)
+for a persistent default.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+EXIT_USAGE = 2
+
+
+def load_config() -> dict:
+    cfg = {}
+    path = Path(os.environ.get("EH_CONFIG", str(Path.home() / ".config" / "eh" / "config")))
+    if path.exists():
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        if parser.has_section("eh"):
+            cfg.update(parser["eh"])
+    return cfg
+
+
+def transport_settings():
+    cfg = load_config()
+    transport = os.environ.get("EH_TRANSPORT", cfg.get("transport", "docker"))
+    host = os.environ.get("EH_HOST", cfg.get("host", ""))
+    container = os.environ.get("EH_CONTAINER", cfg.get("container", "emacs-harness"))
+    sock = os.environ.get("EH_SOCK", cfg.get("sock", "/run/eh/eh.sock"))
+    return transport, host, container, sock
+
+
+def send_request(req: dict, timeout: float) -> dict:
+    transport, host, container, sock_path = transport_settings()
+    line = (json.dumps(req) + "\n").encode()
+
+    if transport == "local":
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout + 10)
+            s.connect(sock_path)
+            s.sendall(line)
+            chunks = []
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if chunk.endswith(b"\n"):
+                    break
+            return json.loads(b"".join(chunks).decode())
+        except OSError as e:
+            return {"ok": False, "error": {"message": f"cannot reach ehd (local, {sock_path}): {e}"},
+                    "exit_code": 5}
+        finally:
+            s.close()
+
+    if transport == "docker":
+        argv = ["docker", "exec", "-i", container, "ehd-cli"]
+    elif transport == "ssh":
+        if not host:
+            return {"ok": False, "error": {"message": "EH_TRANSPORT=ssh requires EH_HOST"},
+                    "exit_code": EXIT_USAGE}
+        argv = ["ssh", host, "--", "docker", "exec", "-i", container, "ehd-cli"]
+    else:
+        return {"ok": False, "error": {"message": f"unknown transport: {transport}"},
+                "exit_code": EXIT_USAGE}
+
+    try:
+        proc = subprocess.run(argv, input=line, capture_output=True, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": {"message": "transport timed out"}, "exit_code": 3}
+    if not proc.stdout:
+        return {"ok": False, "error": {"message": proc.stderr.decode(errors="replace") or
+                                        "no response from ehd"}, "exit_code": 5}
+    try:
+        return json.loads(proc.stdout.decode().strip().splitlines()[-1])
+    except Exception:
+        return {"ok": False, "error": {"message": proc.stdout.decode(errors="replace")},
+                "exit_code": 5}
+
+
+def parse_region(vals):
+    if not vals:
+        return None
+    return [int(vals[0]), int(vals[1])]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="eh")
+    p.add_argument("--session", default=None)
+    p.add_argument("--timeout", type=float, default=30)
+    p.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("doctor")
+
+    sess = sub.add_parser("session")
+    sess_sub = sess.add_subparsers(dest="action", required=True)
+    sn = sess_sub.add_parser("new")
+    sn.add_argument("--name", required=True)
+    sn.add_argument("--profile", default="smoke")
+    sn.add_argument("--geometry", default="1280x800")
+    sn.add_argument("--theme", default=None)
+    sn.add_argument("--emacs", default=None)
+    sess_sub.add_parser("list")
+    sr = sess_sub.add_parser("reset")
+    sr.add_argument("--name", default=None)
+    srm = sess_sub.add_parser("rm")
+    srm.add_argument("--name", default=None)
+
+    ev = sub.add_parser("eval")
+    ev.add_argument("form")
+    ev.add_argument("--out", default=None)
+
+    sn2 = sub.add_parser("snapshot")
+    sn2.add_argument("--buffer", default=None)
+    sn2.add_argument("--window", action="store_true")
+    sn2.add_argument("--region", nargs=2, metavar=("BEG", "END"))
+    sn2.add_argument("--props", default=None)
+    sn2.add_argument("--visible-only", action="store_true")
+    sn2.add_argument("--no-text", action="store_true")
+    sn2.add_argument("--images", action="store_true")
+    sn2.add_argument("--format", choices=["sexp", "json"], default="json")
+
+    sub.add_parser("describe")
+
+    kk = sub.add_parser("keys")
+    kk.add_argument("keys", nargs="+")
+    kk.add_argument("--x", action="store_true")
+
+    tt = sub.add_parser("type")
+    tt.add_argument("text")
+
+    ck = sub.add_parser("click")
+    g = ck.add_mutually_exclusive_group()
+    g.add_argument("--at-point", action="store_true")
+    g.add_argument("--at", default=None)
+    g.add_argument("--at-text", default=None)
+    g.add_argument("--xy", default=None)
+    ck.add_argument("--button", type=int, default=1)
+    ck.add_argument("--double", action="store_true")
+
+    dr = sub.add_parser("drag")
+    dr.add_argument("--from", dest="from_", required=True)
+    dr.add_argument("--to", required=True)
+
+    sc = sub.add_parser("scroll")
+    scg = sc.add_mutually_exclusive_group(required=True)
+    scg.add_argument("--lines", type=int)
+    scg.add_argument("--pixels", type=int)
+
+    an = sub.add_parser("answer")
+    an.add_argument("value")
+
+    wt = sub.add_parser("wait")
+    wt.add_argument("what")
+    wt.add_argument("--timeout", type=float, default=30)
+    wt.add_argument("--poll", type=float, default=50)
+
+    se = sub.add_parser("settle")
+    se.add_argument("--frames-stable", type=int, default=2)
+    se.add_argument("--timeout", type=float, default=5)
+
+    sh = sub.add_parser("shot")
+    sh.add_argument("--out", default=None)
+    mode = sh.add_mutually_exclusive_group()
+    mode.add_argument("--frame", action="store_true")
+    mode.add_argument("--display", action="store_true")
+
+    vd = sub.add_parser("video")
+    vd_sub = vd.add_subparsers(dest="action", required=True)
+    vs = vd_sub.add_parser("start")
+    vs.add_argument("--out", default=None)
+    vd_sub.add_parser("stop")
+
+    ds = sub.add_parser("diff-shot")
+    ds.add_argument("name")
+    ds.add_argument("--tolerance", type=float, default=0.002)
+
+    ba = sub.add_parser("baseline")
+    ba_sub = ba.add_subparsers(dest="action", required=True)
+    baa = ba_sub.add_parser("accept")
+    baa.add_argument("name", nargs="?")
+    baa.add_argument("--all", action="store_true")
+
+    rn = sub.add_parser("run")
+    rn.add_argument("profile")
+    rn.add_argument("--scenario", action="append", default=[])
+    rn.add_argument("--tag", default=None)
+    rn.add_argument("--batch", action="store_true")
+    rn.add_argument("--reuse-session", action="store_true")
+    rn.add_argument("--junit", default=None)
+
+    lg = sub.add_parser("logs")
+    lg.add_argument("--service", default="emacs")
+    lg.add_argument("--tail", type=int, default=100)
+
+    return p
+
+
+def to_request(args) -> dict:
+    cmd = args.command
+    a = {}
+    if cmd == "session":
+        cmd = f"session-{args.action}"
+        if args.action == "new":
+            a = dict(name=args.name, profile=args.profile, geometry=args.geometry,
+                      theme=args.theme, emacs=args.emacs)
+        else:
+            a = dict(name=getattr(args, "name", None))
+    elif cmd == "eval":
+        a = dict(form=args.form)
+    elif cmd == "snapshot":
+        a = dict(buffer=args.buffer, window=args.window, region=parse_region(args.region),
+                  props=args.props.split(",") if args.props else None,
+                  visible_only=args.visible_only, no_text=args.no_text, images=args.images,
+                  format=args.format)
+    elif cmd == "keys":
+        a = dict(keys=args.keys, x=args.x)
+    elif cmd == "type":
+        a = dict(text=args.text)
+    elif cmd == "click":
+        a = dict(at_point=args.at_point, at=args.at, at_text=args.at_text,
+                  xy=[int(v) for v in args.xy.split(",")] if args.xy else None,
+                  button=args.button, double=args.double)
+    elif cmd == "drag":
+        a = dict(**{"from": args.from_}, to=args.to)
+    elif cmd == "scroll":
+        a = dict(lines=args.lines, pixels=args.pixels)
+    elif cmd == "answer":
+        a = dict(value=args.value)
+    elif cmd == "wait":
+        a = dict(what=args.what, is_name=not args.what.strip().startswith("("),
+                  timeout=args.timeout, poll_ms=args.poll)
+    elif cmd == "settle":
+        a = dict(frames_stable=args.frames_stable, timeout=args.timeout)
+    elif cmd == "shot":
+        a = dict(out=args.out, display=args.display)
+    elif cmd == "video":
+        cmd = f"video-{args.action}"
+        a = dict(out=getattr(args, "out", None))
+    elif cmd == "diff-shot":
+        a = dict(name=args.name, tolerance=args.tolerance)
+    elif cmd == "baseline":
+        cmd = f"baseline-{args.action}"
+        a = dict(name=args.name)
+    elif cmd == "run":
+        a = dict(profile=args.profile, scenario=args.scenario, tag=args.tag,
+                  batch=args.batch, reuse_session=args.reuse_session)
+    elif cmd == "logs":
+        a = dict(service=args.service, tail=args.tail)
+        # profile is a positional arg on `eh run`; ehd's session must already
+        # target that profile (`eh session new --profile ...`), so fold it
+        # into the session name convention when the caller didn't pass one.
+    return dict(cmd=cmd, session=args.session, args=a, timeout=args.timeout)
+
+
+def render(args, resp: dict) -> None:
+    as_json = args.json or not sys.stdout.isatty()
+    if as_json:
+        print(json.dumps(resp, indent=2 if sys.stdout.isatty() else None))
+        return
+
+    cmd = args.command
+    if cmd == "doctor":
+        for c in resp.get("checks", []):
+            mark = "OK  " if c["ok"] else "FAIL"
+            print(f"[{mark}] {c['check']:<32} {c.get('detail', '')}")
+        print("ALL GREEN" if resp.get("ok") else "DOCTOR FOUND PROBLEMS")
+    elif cmd == "run":
+        summary = resp.get("summary", {})
+        for t in summary.get("tests", []):
+            print(f"{t['status'].upper():8s} {t['name']}")
+        if "run_dir" in resp:
+            print(resp["run_dir"])
+    elif cmd == "eval":
+        if "value" in resp:
+            print(resp["value"])
+        elif "value_file" in resp:
+            print(resp["value_file"])
+        if resp.get("error"):
+            print(resp["error"].get("message", ""), file=sys.stderr)
+    elif cmd == "snapshot":
+        print(json.dumps(resp.get("snapshot"), indent=2))
+    elif cmd == "describe":
+        print(json.dumps(resp.get("describe"), indent=2))
+    elif cmd == "logs":
+        for line in resp.get("lines", []):
+            print(line)
+    else:
+        print(json.dumps(resp, indent=2))
+
+    if not resp.get("ok") and resp.get("error"):
+        print(f"error: {resp['error'].get('message', resp['error'])}", file=sys.stderr)
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    req = to_request(args)
+    resp = send_request(req, args.timeout)
+    render(args, resp)
+    return int(resp.get("exit_code", 0 if resp.get("ok") else 1))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
