@@ -1,0 +1,16 @@
+# Local development / CI convenience wrapper around the single image
+# (DESIGN.md §5.1). The supported unRAID deployment is the plain
+# container; this exists so `docker compose up` works on a laptop.
+services:
+  emacs-harness:
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+    image: emacs-harness:dev
+    container_name: emacs-harness
+    command: ["server"]
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./runs:/var/lib/eh/runs
+    shm_size: "1gb"
