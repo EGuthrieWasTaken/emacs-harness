@@ -254,11 +254,21 @@ is the behaviour; the read-only property is only the mechanism."
       (ert-fail (format "%smode line %S does not match %S" (if message (concat message ": ") "") ml regexp)))))
 
 (cl-defun eh-expect-no-visual-drift (name &key tolerance mask message)
-  "Screenshot capture only in phase 1; full baseline diffing is phase 2 (§14)."
-  (ignore tolerance mask message)
-  (let ((path (expand-file-name (format "%s.png" name)
-                                 (eh--scenario-artifact-dir eh-current-scenario-name))))
-    (eh-shot-to-file path)))
+  "Screenshot the frame and assert it matches the profile's baseline for
+NAME under the session's Emacs version/geometry/theme (§6.4, §8.3).
+Artifacts (actual/diff PNGs) land in this scenario's artifact directory,
+so a failure's screenshots are in the same place as its other artifacts."
+  (let ((r (eh-diff-shot name :tolerance tolerance :mask mask
+                          :out-dir (eh--scenario-artifact-dir eh-current-scenario-name))))
+    (unless (plist-get r :ok)
+      (ert-fail
+       (format "%svisual drift in %s: %s"
+               (if message (concat message ": ") "") name
+               (or (plist-get r :error)
+                   (format "ratio %.4f exceeds tolerance (%s/%s px changed); see %s vs %s"
+                           (plist-get r :ratio) (plist-get r :changed-pixels)
+                           (plist-get r :total-pixels) (plist-get r :actual)
+                           (plist-get r :baseline))))))))
 
 (defun eh-expect-messages-match (regexp &optional message)
   (let ((text (if (get-buffer "*Messages*")

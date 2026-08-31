@@ -17,6 +17,17 @@
 (defvar eh-run-dir nil
   "Per-session scratch directory, e.g. /run/eh/<session>.  Holds in/, out/.")
 
+(defvar eh-profile-dir nil
+  "Set by the per-session generated init file: the profile's directory
+root, e.g. /srv/profiles/jsonyter.  Baselines live under
+<eh-profile-dir>/baselines/<emacs-version>/<geometry>/<theme>/ (§8.4).")
+(defvar eh-session-theme nil
+  "Set by the per-session generated init file: the --theme value passed
+to `eh session new', or nil for the profile's default faces.")
+(defvar eh-session-geometry nil
+  "Set by the per-session generated init file: \"WIDTHxHEIGHT\", used to
+key baselines by geometry alongside Emacs version and theme (§7.3).")
+
 (defvar eh-strict-prompts t
   "When non-nil, an unscripted interactive prompt is an error, not a hang.
 The default in `run' mode; server mode should set this to nil so a human
@@ -494,6 +505,17 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
   (execute-kbd-macro (string-to-vector text))
   t)
 
+(defun eh-scroll-pixels (n)
+  "Scroll the selected window by N pixels.  `pixel-scroll-precision-mode'
+only exists on Emacs 29+; fall back to `set-window-vscroll' (available
+since Emacs 24) so this works across the whole 27.1+ matrix (§13.3)."
+  (if (fboundp 'pixel-scroll-precision-scroll-up)
+      (if (>= n 0)
+          (pixel-scroll-precision-scroll-up n)
+        (pixel-scroll-precision-scroll-down (- n)))
+    (set-window-vscroll nil (max 0 (+ (window-vscroll nil t) n)) t))
+  t)
+
 ;;; ---------------------------------------------------------------------
 ;;; §6.4 frame export
 
@@ -515,6 +537,157 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
 
 (defun eh-shot-to-file-json (path &optional type)
   (eh--raw-json (json-encode (eh-shot-to-file path type))))
+
+;;; ---------------------------------------------------------------------
+;;; §6.4/§8.3 baselines and pixel diff
+;;;
+;;; Pixel comparison happens *inside Emacs*, via `call-process' to
+;;; ImageMagick, for the same reason scenarios run inside Emacs (§8.1):
+;;; `eh-expect-no-visual-drift' is called mid-scenario, with no channel
+;;; back out to `ehd'.  The CLI-level `eh diff-shot'/`eh baseline accept'
+;;; commands are thin `emacs_eval' wrappers around these same functions
+;;; (see ehd.py), so there is exactly one implementation of the compare.
+
+(defun eh--emacs-version-dir ()
+  (format "%d.%d" emacs-major-version emacs-minor-version))
+
+(defun eh-baseline-dir ()
+  "Directory holding baselines for the current profile, Emacs version,
+geometry and theme (DESIGN §8.4: baselines/<emacs>/<geometry>/<theme>/)."
+  (unless eh-profile-dir (error "eh: eh-profile-dir is unset"))
+  (expand-file-name
+   (format "%s/%s/%s" (eh--emacs-version-dir)
+           (or eh-session-geometry "unknown-geometry")
+           (or eh-session-theme "default"))
+   (expand-file-name "baselines" eh-profile-dir)))
+
+(defun eh-baseline-path (name)
+  (expand-file-name (format "%s.png" name) (eh-baseline-dir)))
+
+(defun eh-baseline-mask-path (name)
+  (expand-file-name (format "%s.mask.json" name) (eh-baseline-dir)))
+
+(defun eh--read-mask-json (path)
+  "Read a NAME.mask.json baseline sidecar: a JSON array of rectangles
+\[{\"x\":..,\"y\":..,\"w\":..,\"h\":..}, ...] excluded from pixel comparison
+\(DESIGN §6.4).  Each rectangle comes back as a list (X Y W H)."
+  (when (file-exists-p path)
+    (let* ((json-object-type 'alist) (json-array-type 'list) (json-key-type 'symbol)
+           (rects (json-read-file path)))
+      (mapcar (lambda (r) (list (cdr (assq 'x r)) (cdr (assq 'y r))
+                                 (cdr (assq 'w r)) (cdr (assq 'h r))))
+              rects))))
+
+(defun eh--masked-copy (src masks dest)
+  "Copy image SRC to DEST with each (X Y W H) rect in MASKS blacked out,
+so masked regions read as identical in both images being compared and so
+contribute nothing to the pixel-diff count."
+  (let ((args (list src)))
+    (dolist (m masks)
+      (cl-destructuring-bind (x y w h) m
+        (setq args (append args
+                            (list "-fill" "black" "-draw"
+                                  (format "rectangle %d,%d,%d,%d" x y (+ x w) (+ y h)))))))
+    (setq args (append args (list dest)))
+    (let ((code (apply #'call-process "convert" nil nil nil args)))
+      (unless (zerop code) (error "eh: convert (mask) exited %d" code)))
+    dest))
+
+(defun eh--png-pixel-count (path)
+  (with-temp-buffer
+    (call-process "identify" nil t nil "-format" "%w %h" path)
+    (let ((parts (split-string (buffer-string))))
+      (* (string-to-number (or (nth 0 parts) "0"))
+         (string-to-number (or (nth 1 parts) "0"))))))
+
+(defun eh--compare-ae (actual baseline diff-out)
+  "Run ImageMagick `compare -metric AE', return the changed-pixel count.
+Signals an error on a real comparison failure (size mismatch, missing
+file); exit 1 -- \"images differ\" -- is the expected common case, not
+an error."
+  (with-temp-buffer
+    (let ((code (call-process "compare" nil t nil
+                               "-metric" "AE" "-fuzz" "1%" actual baseline diff-out)))
+      (let* ((s (string-trim (buffer-string)))
+             (n (and (string-match-p "\\`[0-9.]+\\'" s) (string-to-number s))))
+        (if (memq code '(0 1))
+            (or n (error "eh: compare produced no AE value: %s" s))
+          (error "eh: compare exited %d: %s" code s))))))
+
+(cl-defun eh-diff-shot (name &key tolerance mask out-dir)
+  "Screenshot the frame and compare it against the profile's baseline for
+NAME under the session's Emacs version/geometry/theme (§6.4, §8.3).
+MASK, given, overrides the baseline's own NAME.mask.json sidecar; each
+entry is a (X Y W H) rectangle.  Returns a plist:
+\(:ok BOOL :changed-pixels N :total-pixels N :ratio F
+ :actual PATH :diff PATH-OR-NIL :baseline PATH :error STRING-OR-NIL\)."
+  (let* ((tolerance (or tolerance 0.002))
+         (out-dir (or out-dir eh-run-dir))
+         (actual (expand-file-name (format "%s.actual.png" name) out-dir))
+         (baseline (eh-baseline-path name)))
+    (make-directory out-dir t)
+    (eh-shot-to-file actual)
+    (if (not (file-exists-p baseline))
+        (list :ok nil :changed-pixels nil :total-pixels nil :ratio nil
+              :actual actual :diff nil :baseline baseline
+              :error (format "no baseline for %s at %s -- run `eh baseline accept %s'"
+                              name baseline name))
+      (condition-case err
+          (let* ((diff (expand-file-name (format "%s.diff.png" name) out-dir))
+                 (masks (or mask (eh--read-mask-json (eh-baseline-mask-path name))))
+                 (cmp-actual (if masks
+                                 (eh--masked-copy actual masks
+                                                   (expand-file-name (format "%s.actual-masked.png" name) out-dir))
+                               actual))
+                 (cmp-baseline (if masks
+                                    (eh--masked-copy baseline masks
+                                                      (expand-file-name (format "%s.baseline-masked.png" name) out-dir))
+                                  baseline))
+                 (changed (eh--compare-ae cmp-actual cmp-baseline diff))
+                 (total (eh--png-pixel-count actual))
+                 (ratio (if (> total 0) (/ (float changed) total) 1.0)))
+            (list :ok (<= ratio tolerance) :changed-pixels changed :total-pixels total
+                  :ratio ratio :actual actual :diff diff :baseline baseline :error nil))
+        (error (list :ok nil :changed-pixels nil :total-pixels nil :ratio nil
+                      :actual actual :diff nil :baseline baseline
+                      :error (error-message-string err)))))))
+
+(defun eh-diff-shot-json (name &optional tolerance)
+  (let ((r (eh-diff-shot name :tolerance tolerance)))
+    (eh--raw-json
+     (json-encode
+      `((ok . ,(if (plist-get r :ok) t :json-false))
+        (changed_pixels . ,(or (plist-get r :changed-pixels) :json-false))
+        (total_pixels . ,(or (plist-get r :total-pixels) :json-false))
+        (ratio . ,(or (plist-get r :ratio) :json-false))
+        (actual . ,(plist-get r :actual))
+        (diff . ,(or (plist-get r :diff) :json-false))
+        (baseline . ,(plist-get r :baseline))
+        (error . ,(or (plist-get r :error) :json-false)))))))
+
+(cl-defun eh-baseline-accept (name &key all out-dir)
+  "Copy actual screenshot(s) captured by a prior `eh-diff-shot' into the
+baseline directory for the current Emacs version/geometry/theme.  With
+ALL non-nil, accept every *.actual.png found in OUT-DIR (default
+`eh-run-dir'), ignoring NAME.  Returns the list of names accepted."
+  (let* ((out-dir (or out-dir eh-run-dir))
+         (names (if all
+                    (mapcar (lambda (f) (string-remove-suffix ".actual.png" (file-name-nondirectory f)))
+                            (directory-files out-dir nil "\\.actual\\.png\\'"))
+                  (list name))))
+    (make-directory (eh-baseline-dir) t)
+    (let (accepted)
+      (dolist (n names)
+        (let ((src (expand-file-name (format "%s.actual.png" n) out-dir)))
+          (when (and n (file-exists-p src))
+            (copy-file src (eh-baseline-path n) t)
+            (push n accepted))))
+      (nreverse accepted))))
+
+(defun eh-baseline-accept-json (name all)
+  (let ((accepted (eh-baseline-accept (unless (or (null name) (string-empty-p name)) name)
+                                       :all (and all t))))
+    (eh--raw-json (json-encode `((ok . t) (accepted . ,(vconcat accepted)))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; §12 eh doctor
