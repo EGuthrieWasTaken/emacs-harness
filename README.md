@@ -6,11 +6,14 @@ control surface for evaluating Lisp, sending real keystrokes and mouse clicks,
 taking screenshots, and asserting on what Emacs actually drew — plus a browser
 view of the same live instance for point-and-click work and human eyeballs.
 
-Built first for [jsonyter.el](https://github.com/EGuthrieWasTaken/jsonyter.el),
-whose interesting behaviour — sliced inline images, output overlays, read-only
-result regions, streaming redraws, mode-line kernel state — is invisible to
-`emacs --batch`. Nothing in the core knows about jsonyter: packages are
-described by **profiles**, and jsonyter is simply the first one.
+Built for *any* Emacs package whose interesting behaviour is invisible to
+`emacs --batch` — sliced inline images, output overlays, read-only regions,
+streaming redraws, mode-line state pushed from a subprocess, scroll and
+point discipline, and anything else that only exists once there is real
+redisplay. Nothing in the core knows about any specific package: a package
+under test is described by a **profile** (a directory — see DESIGN.md §8.4),
+and the core is deliberately generic — proven by the fact that
+`profiles/smoke/` needs none of it (§8.5).
 
 ## Status
 
@@ -24,11 +27,10 @@ and pixel baselines via `eh diff-shot`/`eh baseline accept` with
 scenario-level `eh-expect-no-visual-drift`. Phase 3: the `--emacs V,...`
 matrix flag on `eh run` and a GitHub Actions workflow
 (`.github/workflows/ci.yml`) that builds the image and runs `eh doctor` +
-`eh run smoke` headlessly. Not yet built: the `jsonyter` profile itself
-(`profiles/jsonyter/` doesn't exist yet, pending the actual package repo —
-so the matrix flag's second acceptance test, "`eh run jsonyter --emacs
-27.2,29.4`", can't be run end-to-end until that profile lands), pinned
-multi-version Emacs *images* (the matrix flag works against whatever
+`eh run smoke` headlessly. Not yet built: any profile beyond `smoke` itself
+(so the matrix flag's second acceptance test, "`eh run <profile> --emacs
+27.2,29.4` for a real profile", can't be run end-to-end until one exists),
+pinned multi-version Emacs *images* (the matrix flag works against whatever
 binaries you point it at, but this repo doesn't build or ship `27.2`/`29.4`
 binaries — see DESIGN §13.3 open question 1), and the MCP server (Phase 4).
 
@@ -102,16 +104,19 @@ freely, but rename consistently.
 
 ## The one-paragraph version
 
-A container runs `Xvfb`, a pinned cairo-enabled GNU Emacs, a Jupyter server
-with real kernels, and a scriptable fake `jsonyter` bridge. A small in-container
-dispatcher (`ehd`) exposes that Emacs over a Unix socket; a thin client (`eh`)
-reaches it over SSH from wherever the agent is running. The agent's default
-move is **not** to look at pixels: it asks Emacs for a structured dump of buffer
-text, overlays, text properties, faces and image descriptors, and asserts on
+A container runs `Xvfb`, a pinned cairo-enabled GNU Emacs, and whatever side
+services a given profile declares (DESIGN §9 covers the pattern for a
+package that talks to a subprocess: a real instance of it plus a scriptable
+fake speaking the same protocol). A small in-container dispatcher (`ehd`)
+exposes that Emacs over a Unix socket; a thin client (`eh`) reaches it over
+SSH from wherever the agent is running. The agent's default move is **not**
+to look at pixels: it asks Emacs for a structured dump of buffer text,
+overlays, text properties, faces and image descriptors, and asserts on
 that. Screenshots (`x-export-frames`, taken from inside Emacs — no window
-manager races) are the backstop for the handful of things only redisplay knows.
-Scenarios are ERT tests written in Emacs Lisp that run *inside* the instance
-under test, so the same file works both under the agent's hand and in CI.
+manager races) are the backstop for the handful of things only redisplay
+knows. Scenarios are ERT tests written in Emacs Lisp that run *inside* the
+instance under test, so the same file works both under the agent's hand and
+in CI.
 
 ## Layout
 
@@ -119,7 +124,9 @@ under test, so the same file works both under the agent's hand and in CI.
 emacs-harness/
 ├── DESIGN.md                  ← the spec
 ├── AGENTS.md / CLAUDE.md      ← the agent operating contract (DESIGN §11)
-├── docs/scenarios-jsonyter.md ← the first suite (not yet implemented)
+├── docs/example-scenarios.md  ← a fully worked, fictional-package scenario
+│                                 catalogue illustrating the categories of
+│                                 behaviour a real profile would target
 ├── .github/workflows/ci.yml   ← builds the image, runs `eh doctor` + `eh run smoke` headlessly
 ├── bin/eh                     ← thin client (runs on your laptop)
 ├── container/                 ← Dockerfile, supervisord, entrypoint
@@ -128,7 +135,8 @@ emacs-harness/
 ├── elisp/                     ← eh-driver.el, eh-scenario.el, eh-profile.el, eh-init-core.el
 ├── profiles/
 │   └── smoke/                 ← trivial profile that proves the core is generic
-│       (profiles/jsonyter/ doesn't exist yet -- needs the jsonyter.el repo)
+│       (no other profiles exist yet -- add one for whatever package you
+│        want to test, see DESIGN.md §8.4)
 └── runs/                      ← per-run artifacts (gitignored)
 ```
 

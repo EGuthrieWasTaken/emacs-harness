@@ -2,7 +2,7 @@ name: CI
 
 # DESIGN.md §14 phase 3: "compose.yaml and a GitHub Actions workflow
 # running the same image headlessly. Done when: `eh run smoke` passes in
-# an image built with no Python, Jupyter or jsonyter installed."
+# an image built with no package-specific dependencies installed."
 #
 # Xvfb, openbox, and Emacs all run *inside* the container (ehd's session
 # manager starts them), so this workflow needs nothing beyond `docker

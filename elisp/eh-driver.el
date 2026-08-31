@@ -19,7 +19,7 @@
 
 (defvar eh-profile-dir nil
   "Set by the per-session generated init file: the profile's directory
-root, e.g. /srv/profiles/jsonyter.  Baselines live under
+root, e.g. /srv/profiles/<name>.  Baselines live under
 <eh-profile-dir>/baselines/<emacs-version>/<geometry>/<theme>/ (§8.4).")
 (defvar eh-session-theme nil
   "Set by the per-session generated init file: the --theme value passed

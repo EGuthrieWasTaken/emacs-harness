@@ -2,7 +2,12 @@
 
 **Status:** design, not implemented.
 **Audience:** the agent (or human) implementing this.
-**First consumer:** `jsonyter.el` 2.0.0 — see `docs/scenarios-jsonyter.md`.
+**Worked example:** see `docs/example-scenarios.md` for a fully worked,
+illustrative scenario catalogue. It names no real package — every symbol,
+face and behaviour in it is a generic placeholder — but it is grounded in
+concrete detail (the kind of buffer/overlay/image state a real package would
+actually have) rather than left abstract, so an implementer has something
+runnable to model a real profile on.
 **Deployment target:** the unRAID server (x86_64, dual Xeon E5-2698 v3, 128 GB
 RAM), as a Docker container; reached over SSH, and viewable in a browser
 through the existing Cloudflare Tunnel.
@@ -11,30 +16,36 @@ through the existing Cloudflare Tunnel.
 
 ## 1. The problem
 
-`jsonyter.el` is 5 000+ lines of Emacs Lisp whose most failure-prone behaviour
-is *visual and interactive*:
+Plenty of Emacs packages are 1 000+ lines of Emacs Lisp whose most
+failure-prone behaviour is *visual and interactive* — this harness targets
+that category, not any one package. Recurring shapes that behaviour takes,
+across many unrelated packages:
 
-- inline images, inserted **sliced** one slice per line so that ordinary line
-  scrolling walks through a tall plot;
-- cell output that is **buffer text but read-only**, written without touching
+- inline images, sometimes **sliced** one slice per line so that ordinary
+  line scrolling walks through a tall image;
+- buffer regions that are **text but read-only**, written without touching
   undo or the modified flag;
-- **overlay** cell boundaries, output frames, and a stale-output face that
-  changes when a cell's source hash changes;
-- **streaming** output and `clear_output(wait=True)` redraws;
-- a **mode line** that reports live kernel state pushed from a websocket;
-- **scroll discipline** — "insertion never steals point", but a window already
-  at the end follows new output.
+- **overlay** boundaries, decoration frames, and a face that changes when
+  some underlying state goes stale;
+- **streaming** or otherwise asynchronous output that redraws in place;
+- a **mode line** that reports live state pushed from a subprocess, timer,
+  or network connection;
+- **scroll discipline** — "insertion never steals point", but a window
+  already at the end follows new output.
 
-The existing suite (`test/jsonyter-tests.el`, 49 ERT tests) is excellent and
-should stay, but it runs under `emacs -Q --batch`, where there is no redisplay,
-no image rasterisation, no window geometry, no real key lookup, and no frame.
-It can assert that an `image` display property *exists*; it cannot assert that
-the PNG decoded, that slicing produced 12 addressable lines, that the rule is
-drawn to the right width, or that `C-c C-e` reaches the command the keymap
-claims it does.
+A package with behaviour like this usually already has a good batch ERT
+suite, and that suite should stay — but it runs under `emacs -Q --batch`,
+where there is no redisplay, no image rasterisation, no window geometry, no
+real key lookup, and no frame. It can assert that an `image` display
+property *exists*; it cannot assert that the image actually decoded, that
+slicing produced the right number of addressable lines, that a rule is
+drawn to the right width, or that a key sequence reaches the command the
+keymap claims it does.
 
 This harness closes that gap, and does so in a way an AI agent can operate
-unattended.
+unattended, for *any* package with this shape of behaviour — the package
+under test is described by a **profile** (§8.4), and the core knows nothing
+about any specific one.
 
 ## 2. Goals
 
@@ -46,11 +57,14 @@ unattended.
    byte-identical screenshots, so pixel regressions mean something.
 4. **A browser view** of the live instance, so a human — or an agent using
    Claude-in-Chrome — can watch and click.
-5. **Package-agnostic.** jsonyter is a *profile*. Adding another package is
-   adding a directory, not editing the core.
+5. **Package-agnostic.** Every package under test is a *profile*. Adding a
+   new package to the harness is adding a directory, not editing the core
+   (§8.5 requires proving this before real profiles depend on it).
 6. **One command runs everything**, batch ERT included, and emits a single
    artifact directory an agent can point at when reporting a failure.
-7. **Reproducible across Emacs versions** — jsonyter claims 27.1+, so prove it.
+7. **Reproducible across Emacs versions.** Many packages claim broad support
+   (27.1+ is a common floor); prove whatever range a given profile claims,
+   rather than trusting it.
 
 ## 3. Non-goals
 
@@ -81,11 +95,12 @@ user sees. An agent driving Emacs does not: it can ask, precisely and cheaply,
 - `window-start`, `window-end`, `point`, the scroll position in pixels;
 - the rendered mode line as a string, via `format-mode-line`.
 
-A screenshot of "cell 2's output" costs an image round-trip and answers *fuzzily*.
-A structured snapshot of the same region costs a few hundred tokens of text and
-answers *exactly* — including things the screenshot cannot show, like whether
-the region is read-only or whether the border overlay's face is
-`jsonyter-output-border-stale-face`.
+A screenshot of "the output region" costs an image round-trip and answers
+*fuzzily*. A structured snapshot of the same region costs a few hundred
+tokens of text and answers *exactly* — including things the screenshot
+cannot show, like whether the region is read-only or whether the border
+overlay's face is the package's own "stale" variant rather than its normal
+one.
 
 So the harness offers three tiers, and the agent contract (§11) says to prefer
 the cheapest tier that can answer the question:
@@ -125,9 +140,9 @@ screenshot tooling.
   │    ├── x-export-frames / import / ffmpeg              (tier 3)       │
   │    └── artifacts → /var/lib/eh/runs/<run-id>/                        │
   │                                                                      │
-  │   side services                                                      │
-  │    ├── jupyter-server :8888  (ipykernel, IRkernel, [IJulia])         │
-  │    ├── eh-fake-bridge        (scripted jsonyter protocol, §9)        │
+  │   side services (profile-declared, e.g. §9's real-process +          │
+  │   scriptable-fake-process pattern for a package that talks to a      │
+  │   subprocess)                                                        │
   │    ├── x11vnc :5900 → websockify/noVNC :6080   (browser view, §10)   │
   │    └── openbox               (minimal WM, no keybindings, no decor)  │
   └──────────────────────────────────────────────────────────────────────┘
@@ -161,7 +176,7 @@ HOME, one server socket)`. Sessions are the unit of isolation and of the
 version matrix. `ehd` owns their lifecycle:
 
 ```
-eh session new  --emacs 29.4 --profile jsonyter --geometry 1280x800 --name s1
+eh session new  --emacs 29.4 --profile <name> --geometry 1280x800 --name s1
 eh session list
 eh session reset s1        # kill Emacs, wipe scratch HOME, restart clean
 eh session rm   s1
@@ -279,28 +294,31 @@ eh snapshot [--buffer NAME] [--window] [--region BEG END] [--visible-only]
 
 Output is a list of **runs** — maximal spans over which every reported
 attribute is constant — which keeps a 10 000-line buffer's snapshot small
-while staying exact:
+while staying exact. The example below is illustrative: `example.demo`,
+`demo-mode`, `demo-cell`, and every other `demo-*` symbol are generic
+placeholders standing in for whatever a real profile's package actually
+uses — nothing in this document assumes a specific real package.
 
 ```elisp
 ((:version 1
-  :buffer "analysis.ipynb"
+  :buffer "example.demo"
   :point 412
   :mark nil
   :modified nil
-  :major-mode python-mode
-  :minor-modes (jsonyter-mode jsonyter-notebook-mode)
-  :mode-line "  analysis.ipynb   py:idle [main]   (Python/Jsonyter)"
+  :major-mode fundamental-mode
+  :minor-modes (demo-mode)
+  :mode-line "  example.demo   idle [main]   (Demo)"
   :window (:start 1 :end 980 :height-lines 44 :width-cols 120
            :vscroll 0 :point-visible t))
- (:beg 1   :end 34  :text "# code · python\n"
-  :face jsonyter-code-cell-face
-  :overlays ((:id "ov1" :props (jsonyter-cell 0 jsonyter-cell-type "code"
+ (:beg 1   :end 34  :text "# region 0 · source\n"
+  :face demo-region-face
+  :overlays ((:id "ov1" :props (demo-cell 0 demo-cell-type "code"
                                 before-string "…" evaporate t))))
  (:beg 34  :end 47  :text "x = 1\n"
   :face nil :read-only nil
   :text-props nil)                      ; source carries no properties
  (:beg 47  :end 48  :text "\n"
-  :face jsonyter-output-border-face :read-only t
+  :face demo-output-border-face :read-only t
   :display (:kind rule :width-px 620))
  (:beg 48  :end 60  :text " "                     ; sliced image, 12 rows
   :read-only t
@@ -317,43 +335,44 @@ Rules for the implementer:
   `priority` wins), not just the text property. Report the symbol, or a list of
   symbols, or an anonymous plist — whatever `face-at-point` would see.
 - **`:display` decodes image descriptors.** Do not dump the raw base64 string.
-  Report type, intrinsic and computed pixel size, `:scale`, and — crucially for
-  jsonyter — whether the region is a *sequence of slices* and how many. Include
-  a `sha256` of the image data so a scenario can assert "the same plot" without
-  storing pixels. `(image-size IMG t)` gives the pixel size; `create-image`
+  Report type, intrinsic and computed pixel size, `:scale`, and — crucially
+  for any package that slices tall images into scrollable rows — whether the
+  region is a *sequence of slices* and how many. Include a `sha256` of the
+  image data so a scenario can assert "the same image" without storing
+  pixels. `(image-size IMG t)` gives the pixel size; `create-image`
   descriptors carry `:slice`.
 - **`--window` reports what is on screen**, not what is in the buffer:
   `window-start`, `window-end`, `pos-visible-in-window-p` for point, the
   vertical scroll in pixels (`window-vscroll` with `PIXELS-P`), and the
-  rendered `mode-line`/`header-line` via `format-mode-line`. jsonyter's scroll
-  discipline and mode-line states are asserted from here.
+  rendered `mode-line`/`header-line` via `format-mode-line`. A package's
+  scroll discipline and mode-line states are asserted from here.
 - **Stability over prettiness.** The output is diffed across runs and pasted
   into agent context. Sort overlays deterministically (by `overlay-start`, then
   `overlay-end`, then a stable hash of properties — *never* by the order
   `overlays-in` happens to return, which is unspecified). Elide huge property
   values behind a length + hash. Keep the key order fixed.
-- **Overlay properties and text properties are different things, and jsonyter
-  uses both.** Its cell metadata (`jsonyter-cell`, `jsonyter-cell-type`,
-  `jsonyter-source-end`, `jsonyter-source-hash`, `jsonyter-output-stale`,
-  `jsonyter-exec-count`, …) lives entirely in **overlay** properties, while
-  `read-only` is applied as a **text** property
-  (`add-text-properties … '(read-only t front-sticky (read-only) rear-nonsticky t)`).
-  Report the two separately — `:overlays` and `:text-props` — and never
-  collapse them into one bag, or a scenario asserting "the output is read-only"
-  will silently pass on an overlay that says nothing of the kind.
+- **Overlay properties and text properties are different things, and a
+  package may use both** — this is common enough to design for, not an
+  exception. If a package's own metadata (cell/region ids, hashes, staleness
+  flags, …) lives in **overlay** properties while `read-only` is applied as
+  a **text** property (`add-text-properties … '(read-only t front-sticky
+  (read-only) rear-nonsticky t)`), report the two separately — `:overlays`
+  and `:text-props` — and never collapse them into one bag, or a scenario
+  asserting "the output is read-only" will silently pass on an overlay that
+  says nothing of the kind.
 
-- **`--props`** lets a scenario ask for exactly the properties it cares about,
-  e.g. `--props jsonyter-cell,jsonyter-cell-type,jsonyter-source-hash,jsonyter-output-stale`.
-  Default to a profile-declared list (§8.2) rather than dumping everything.
+- **`--props`** lets a scenario ask for exactly the properties it cares
+  about, e.g. `--props demo-cell,demo-cell-type,demo-source-hash`. Default
+  to a profile-declared list (§8.2) rather than dumping everything.
 
 #### `eh describe`
 
 A one-screen orientation dump: session name, Emacs version and build features
 (`cairo`, `pgtk`, image types available), frame geometry in pixels and
-characters, the window tree, every live buffer with its modes and size, and the
-profile's own status line (for jsonyter: the session table, kernel ids, and
-bridge process state). This is what an agent should call first when it does not
-know where it is.
+characters, the window tree, every live buffer with its modes and size, and
+the profile's own status line (whatever a given profile registers there —
+e.g. a session table, subprocess ids, or bridge process state). This is what
+an agent should call first when it does not know where it is.
 
 ### 6.3 Tier 2 — input
 
@@ -370,10 +389,12 @@ and the reason matters:
 
 - it performs real keymap lookup, so a broken or shadowed binding fails the
   test the way it fails the user;
-- it runs the real command loop, so `this-command` / `last-command` chains work
-  — jsonyter's history walking (`jsonyter-repl-previous-input`) and Org's
-  conditional key fallthrough (`C-RET` inside a `jy:` block vs. outside) both
-  depend on this, and neither is exercised by calling the function directly;
+- it runs the real command loop, so `this-command` / `last-command` chains
+  work — a package's history-walking command (only inserting the previous
+  history entry when called right after itself) and conditional key
+  fallthrough (a key that behaves differently depending on what ran last)
+  both depend on this, and neither is exercised by calling the underlying
+  function directly;
 - it is **synchronous** and returns errors to the caller.
 
 Two caveats to encode in the driver:
@@ -429,9 +450,10 @@ return shape on 27.2 as well as 31.x rather than trusting this document.
 #### `eh type TEXT`
 
 Literal self-inserting text, via `execute-kbd-macro` on
-`(string-to-vector TEXT)` or `insert` for speed. Prefer the macro path when the
-test cares about `post-self-insert-hook`, electric modes, or jsonyter's
-per-edit source-hash invalidation — which it usually does.
+`(string-to-vector TEXT)` or `insert` for speed. Prefer the macro path when
+the test cares about `post-self-insert-hook`, electric modes, or a package's
+own per-edit hooks (e.g. invalidating a cached hash on every keystroke) —
+which it usually does.
 
 ### 6.4 Tier 3 — pixels
 
@@ -493,9 +515,9 @@ Use pixel baselines for a small, curated set (§8.3), not everywhere.
 
 ### 6.5 Tier 0 — synchronisation, the thing that actually decides whether this works
 
-Every flaky GUI test is a missing wait. jsonyter is asynchronous end to end —
-subprocess, websocket, streamed outputs reconciled by count — so the harness
-must make waiting the easy path.
+Every flaky GUI test is a missing wait. Many packages worth testing this way
+are asynchronous end to end — a subprocess, a network connection, streamed
+output reconciled by count — so the harness must make waiting the easy path.
 
 #### `eh wait FORM [--timeout N] [--poll MS]`
 
@@ -538,9 +560,9 @@ Profiles register their own, so scenarios read well and the knowledge lives in
 one place:
 
 ```
-eh wait kernel-idle --session s1        # (not (jsonyter-current-kernel-busy-p))
+eh wait subprocess-idle --session s1    # (not (demo-current-process-busy-p))
 eh wait bridge-ready
-eh wait cell-output --cell 2            # cell 2 has non-empty output
+eh wait region-output --region 2        # region 2 has non-empty output
 eh wait mode-line-matches ':idle'
 ```
 
@@ -590,11 +612,14 @@ section is a checklist; treat it as acceptance criteria for phase 0.
 - **Never inherit the developer's config.** On Emacs 29+ use
   `--init-directory=/run/eh/<s>/emacs.d`. On 27/28 that flag does not exist, so
   set `HOME=/tmp/eh-scratch-<s>` for the process — which is required anyway, so
-  that `~/.jupyter`, `~/.ipython`, `~/.local` and jsonyter's own scratch files
-  land somewhere disposable. Doing both on all versions keeps the matrix
-  uniform.
-- No `~/.authinfo`, no GPG agent, no real Jupyter token file. The harness's
-  Jupyter token is a fixed constant baked into the image.
+  that a package's own scratch files, and any per-user dotfiles a subprocess
+  it manages might read (`~/.cache`, `~/.local`, a language-specific config
+  dir, …), land somewhere disposable. Doing both on all versions keeps the
+  matrix uniform.
+- No `~/.authinfo`, no GPG agent, no real credentials of any kind. If a
+  profile's package (or a local service it talks to) needs an auth token for
+  local dev, bake a fixed constant into the image rather than reading a real
+  one.
 - `eh session reset` wipes the scratch HOME. Scenarios get a fresh session by
   default.
 
@@ -625,9 +650,10 @@ The single largest source of "it looks different on my machine":
 
 `image-scaling-factor` deserves emphasis: it defaults to `auto`, which scales
 images by the frame's font size relative to 11 points. Leave it on `auto` and
-the *same plot renders at different pixel sizes* depending on the font that
-happened to be found — which silently invalidates every jsonyter image
-assertion, including the slice count. Pin it, and pin the font that feeds it.
+the *same image renders at different pixel sizes* depending on the font that
+happened to be found — which silently invalidates every image assertion a
+profile makes, including any slice count. Pin it, and pin the font that
+feeds it.
 
 Bake **exactly one** monospace font into the image (DejaVu Sans Mono is a safe,
 ubiquitous choice) and make `fontconfig` deterministic: no user fonts, a fixed
@@ -643,9 +669,10 @@ otherwise pollute stderr).
 Pin one theme explicitly (`(load-theme 'modus-operandi t)` or plain default
 faces) and make it a profile setting. Two useful extras:
 
-- A `--theme` flag on `eh session new`, so the same scenario can be run under a
-  light and a dark theme. Rendering a jsonyter notebook under both is a
-  ten-line scenario that catches hardcoded colours across the whole package.
+- A `--theme` flag on `eh session new`, so the same scenario can be run under
+  a light and a dark theme. Rendering a package's main view under both is
+  typically a ten-line scenario that catches hardcoded colours across the
+  whole package.
 - Baselines are keyed by theme as well as by Emacs version and geometry.
 
 ### 7.4 Time, randomness and counters
@@ -653,19 +680,22 @@ faces) and make it a profile setting. Two useful extras:
 - `TZ=UTC` and, where a test's output embeds a timestamp, freeze it: advise
   `current-time` / `format-time-string`, or mask the region.
 - `(random "emacs-harness")` seeds Emacs's PRNG reproducibly.
-- Cell ids in `.ipynb` files are random by spec. jsonyter merges by id on save,
-  so scenarios must use **fixtures with fixed ids** (the existing test suite
-  already does this — reuse its fixture text verbatim) and, where new cells are
-  created, either mask the id or stub the id generator.
-- Execution counts (`In[3]`) depend on kernel history. Always start from a
-  fresh kernel in scenarios that assert on them.
+- If a package's file format embeds random ids (many do — merge/diff logic
+  often keys off them), scenarios must use **fixtures with fixed ids** (a
+  package's existing batch test suite usually already has such fixtures —
+  reuse them verbatim) and, where new entries are created live, either mask
+  the id or stub the id generator.
+- Any counter that depends on process history (e.g. an execution/request
+  counter driven by a subprocess) should start from a fresh subprocess in
+  scenarios that assert on it.
 
 ### 7.5 Concurrency
 
-Sessions must not share an X display, a scratch HOME, a Jupyter kernel, or a
-run directory. Give each a display number derived from its index, and have
-`ehd` allocate them from a pool with a lock — `Xvfb` failing to start because
-`:99` is taken produces a confusing downstream failure.
+Sessions must not share an X display, a scratch HOME, a subprocess a
+profile's package manages, or a run directory. Give each a display number
+derived from its index, and have `ehd` allocate them from a pool with a
+lock — `Xvfb` failing to start because `:99` is taken produces a confusing
+downstream failure.
 
 ---
 
@@ -680,7 +710,8 @@ Not shell scripts full of `eh` calls. Reasons:
   racy.
 - Assertions want Lisp values, not JSON round-trips.
 - The same file can run under plain `ert-run-tests-batch-and-exit` in CI.
-- The existing 49-test suite can be lifted into a profile with no rewriting.
+- A package's existing batch ERT suite can be lifted into a profile with no
+  rewriting.
 
 `eh run` therefore means: start a session, load the profile init, load
 `eh-scenario.el` and the scenario files, run the selected ERT tests, collect
@@ -696,47 +727,50 @@ mode — an agent poking at a live instance by hand.
 
 ### 8.2 Scenario DSL
 
-Thin macros over ERT — never a parallel test framework:
+Thin macros over ERT — never a parallel test framework. The scenario below
+is illustrative, for the same fictional `demo-*` package used in §6.2's
+snapshot example — a real profile's scenario file will name its own
+package's functions, faces and fixtures throughout:
 
 ```elisp
-;;; profiles/jsonyter/scenarios/notebook-output.el -*- lexical-binding: t; -*-
+;;; profiles/<name>/scenarios/region-output.el -*- lexical-binding: t; -*-
 
-(eh-scenario jsonyter/notebook-output-is-framed-and-read-only
-  :doc     "A run cell's output is framed, read-only, and not undoable."
-  :needs   (:kernel "python3" :emacs ">= 27.1")
-  :fixture "three-cells.ipynb"
+(eh-scenario demo/region-output-is-framed-and-read-only
+  :doc     "A run region's output is framed, read-only, and not undoable."
+  :needs   (:subprocess "demo-backend" :emacs ">= 27.1")
+  :fixture "three-regions.demo"
   :geometry (1280 . 800)
-  :tags    (notebook output)
+  :tags    (region output)
 
-  (eh-open-fixture "three-cells.ipynb")          ; copies to scratch, opens it
-  (eh-keys "C-c C-k")                            ; start the kernel explicitly
-  (eh-wait-for 'jsonyter-kernel-live :timeout 90)
+  (eh-open-fixture "three-regions.demo")          ; copies to scratch, opens it
+  (eh-keys "C-c C-k")                             ; start the subprocess explicitly
+  (eh-wait-for 'demo-subprocess-live :timeout 90)
 
-  (eh-goto-cell 0)
+  (eh-goto-region 0)
   (eh-keys "<C-return>")
-  (eh-wait-for 'jsonyter-kernel-idle)
-  (eh-wait-for (lambda () (eh-cell-has-output-p 0)))
+  (eh-wait-for 'demo-subprocess-idle)
+  (eh-wait-for (lambda () (eh-region-has-output-p 0)))
 
-  (eh-expect-face (eh-cell-output-border-start 0) 'jsonyter-output-border-face)
-  (eh-expect-read-only (eh-cell-output-region 0))
-  (eh-expect-editable  (eh-cell-source-region 0))
+  (eh-expect-face (eh-region-output-border-start 0) 'demo-output-border-face)
+  (eh-expect-read-only (eh-region-output-region 0))
+  (eh-expect-editable  (eh-region-source-region 0))
   (eh-expect-equal (eh-buffer-modified-p) nil
-                   "running a cell must not mark the buffer modified")
+                   "running a region must not mark the buffer modified")
 
-  (eh-shot "notebook-cell0-output")              ; baseline compare
-  (eh-expect-no-visual-drift "notebook-cell0-output" :tolerance 0.002))
+  (eh-shot "region0-output")              ; baseline compare
+  (eh-expect-no-visual-drift "region0-output" :tolerance 0.002))
 ```
 
 `eh-scenario` expands to an `ert-deftest` plus:
 
-- **skip logic** from `:needs` — missing kernel, wrong Emacs version, no cairo,
-  no SVG support → `ert-skip` with a legible reason, never a failure;
-- **setup/teardown** — fresh scratch dir, fixture copy, buffer cleanup, kernel
-  shutdown, `eh-answers` reset;
+- **skip logic** from `:needs` — missing subprocess, wrong Emacs version, no
+  cairo, no SVG support → `ert-skip` with a legible reason, never a failure;
+- **setup/teardown** — fresh scratch dir, fixture copy, buffer cleanup,
+  subprocess shutdown, `eh-answers` reset;
 - **artifact capture on failure** — screenshot (frame *and* display), full
-  snapshot of every jsonyter buffer, `*Messages*`, the bridge's
-  ` *jsonyter stderr*` buffer, the Jupyter log tail, and the ERT backtrace, all
-  into `runs/<id>/<scenario>/`;
+  snapshot of every buffer the profile cares about, `*Messages*`, any
+  profile-declared log buffers (e.g. a subprocess's stderr), and the ERT
+  backtrace, all into `runs/<id>/<scenario>/`;
 - **timing** into the report.
 
 Core assertion vocabulary (profile-independent):
@@ -764,92 +798,92 @@ property — the property is the mechanism, the ability to type is the behaviour
 Pixel baselines are expensive to review and easy to make flaky. Use them only
 where redisplay is the thing under test:
 
-**Yes:** a rasterised plot in a notebook (proves the PNG decoded and is not a
-placeholder); a tall sliced image (proves N drawable rows, not one blob); the
-output frame rules; a rendered `text/html` block through `shr`; the same
-buffer under light and dark themes; a full-frame "here is what a notebook looks
-like" reference shot per Emacs version.
+**Yes:** a rasterised image the package inserted (proves the PNG decoded and
+is not a placeholder); a tall sliced image (proves N drawable rows, not one
+blob); output frame rules; a rendered rich-text block (e.g. through `shr`);
+the same buffer under light and dark themes; a full-frame "here is what the
+package's main view looks like" reference shot per Emacs version.
 
 **No:** anything about text content, faces, properties, overlays, mode-line
 text, point, scroll position, read-only-ness, saved file bytes. All of that is
 tier 1, where the assertion is exact and the failure message is legible.
 
-Budget: **on the order of 10–15 baselines for the whole jsonyter profile.**
-If it grows past that, something that should have been a tier-1 assertion is
-being done with pixels.
+Budget: **on the order of 10–15 baselines for a typical profile.** If it
+grows past that, something that should have been a tier-1 assertion is being
+done with pixels.
 
 ### 8.4 The profile model
 
 A profile is a directory. The core knows nothing about the package.
 
 ```
-profiles/jsonyter/
+profiles/<name>/
 ├── profile.el          declarative manifest, evaluated by the harness
 ├── init.el             the sandboxed Emacs config for the SUT
 ├── deps.lock           pinned dependency revisions
-├── fixtures/           .ipynb, .py, .org, .R files copied per scenario
-├── bridge-scripts/     fake-bridge fixtures (§9)
+├── fixtures/           files copied per scenario, in whatever format(s)
+│                       the package under test reads
+├── bridge-scripts/     fake-subprocess fixtures, if the package talks to
+│                       one (§9)
 ├── scenarios/*.el
 ├── baselines/<emacs>/<geometry>/<theme>/*.png (+ .mask.json)
 └── services.yaml       which side services this profile needs
 ```
 
-`profile.el` sketch:
+`profile.el` sketch — again illustrative, for the fictional `demo-*` package
+from §6.2 and §8.2:
 
 ```elisp
-(eh-defprofile jsonyter
+(eh-defprofile demo
   :package-path  "/srv/package"                 ; bind-mounted repo
   :load-path     ("/srv/package")
-  :requires      (jsonyter)
+  :requires      (demo)
   :emacs-versions ("27.2" "28.2" "29.4" "30.2" "31.1")
   :system-packages ()                           ; extra apt packages
-  :python-packages ("jsonyter>=1.0.0" "jupyter-server" "ipykernel"
-                    "matplotlib" "numpy")
-  :elisp-deps    ((ess . "24.01.0"))            ; for ess-r-mode notebooks
-  :services      (jupyter)
+  :python-packages ()                           ; only if the package talks
+                                                 ; to a Python-backed service
+  :elisp-deps    ()                             ; pinned Elisp dependencies
+  :services      ()                             ; e.g. (demo-backend) if the
+                                                 ; package needs a real one
   :theme         modus-operandi
   :geometry      (1280 . 800)
 
   ;; properties eh-snapshot reports by default for this package
-  :snapshot-props (jsonyter-cell jsonyter-cell-id jsonyter-cell-type
-                   jsonyter-source-end jsonyter-source-hash
-                   jsonyter-output-stale jsonyter-exec-count
-                   jsonyter-output-string jsonyter-raw-outputs
-                   jsonyter-script-cell jsonyter-org-cell
-                   jsonyter-org-committed jsonyter-running)
+  :snapshot-props (demo-cell demo-cell-id demo-cell-type
+                   demo-source-end demo-source-hash
+                   demo-output-stale demo-exec-count
+                   demo-output-string demo-raw-outputs)
 
   ;; named waiters usable as `eh wait <name>`
-  :waiters ((jsonyter-kernel-live . (lambda () (jsonyter-current-kernel-id)))
-            (jsonyter-kernel-idle . (lambda () (not (jsonyter-current-kernel-busy-p))))
-            (jsonyter-bridge-ready . (lambda () (get-buffer " *jsonyter stderr*"))))
+  :waiters ((demo-subprocess-live . (lambda () (demo-current-subprocess-id)))
+            (demo-subprocess-idle . (lambda () (not (demo-current-subprocess-busy-p))))
+            (demo-bridge-ready . (lambda () (get-buffer " *demo stderr*"))))
 
   ;; extra logs to sweep into the failure bundle
-  :log-buffers (" *jsonyter stderr*" "*Messages*")
-  :log-files   ("/var/log/eh/jupyter.log"))
+  :log-buffers (" *demo stderr*" "*Messages*")
+  :log-files   ("/var/log/eh/demo-backend.log"))
 ```
 
 `init.el` is the *only* configuration the SUT sees, and should be the minimum
-the README tells a user to write plus the harness's determinism block:
+the package's own README tells a user to write plus the harness's
+determinism block:
 
 ```elisp
 (add-to-list 'load-path "/srv/package")
-(require 'jsonyter)
-(add-to-list 'auto-mode-alist '("\\.ipynb\\'" . jsonyter-notebook-open))
-(add-hook 'python-mode-hook #'jsonyter-script-mode-maybe)
-(add-hook 'org-mode-hook    #'jsonyter-org-mode-maybe)
-(setq jsonyter-server-url  "http://127.0.0.1:8888"
-      jsonyter-server-token "eh-harness-fixed-token"
-      jsonyter-token-transport 'env
-      jsonyter-startup-timeout 120)
+(require 'demo)
+(add-to-list 'auto-mode-alist '("\\.demo\\'" . demo-mode))
+(setq demo-backend-url   "http://127.0.0.1:8123"
+      demo-backend-token "eh-harness-fixed-token"
+      demo-startup-timeout 120)
 ```
 
 ### 8.5 Proving the core is generic
 
-Ship a second, trivial profile — `profiles/smoke/` — with no external services
-and three scenarios: open a file, press a key, take a screenshot; assert a
-face; assert an image renders. Its purpose is a build-time guarantee that
-nothing jsonyter-specific has leaked into the core. If `eh run smoke` needs a
-Jupyter server, the abstraction has broken.
+Ship a second, trivial profile — `profiles/smoke/` — with no external
+services and three scenarios: open a file, press a key, take a screenshot;
+assert a face; assert an image renders. Its purpose is a build-time
+guarantee that nothing profile-specific has leaked into the core. If `eh run
+smoke` needs any external service at all, the abstraction has broken.
 
 The third profile to add, when the harness is proven, is the one that will find
 real bugs in *someone else's* code: a small profile for a package Ethan
@@ -857,59 +891,63 @@ actually uses, to sanity-check that the harness is usable by a stranger.
 
 ---
 
-## 9. Kernels: real Jupyter plus a scriptable fake bridge
+## 9. A real backend plus a scriptable fake, for packages that talk to one
 
-Both, because they answer different questions.
+Many Emacs packages worth testing this way front an external process — a
+language server, a REPL/kernel, a daemon they spawn and talk to over a pipe
+or socket. **This is a pattern a profile opts into (§8.4's `:services`), not
+a core assumption** — `profiles/smoke/` needs none of it (§8.5), and neither
+does any profile whose package does all its work inside Emacs. For a
+profile whose package *does* talk to a backend, the harness supports two
+kinds of scenario, because they answer different questions.
 
-### 9.1 Real Jupyter
+### 9.1 A real backend
 
-Baked into the image: `jupyter-server`, `ipykernel`, `matplotlib`, `numpy`, and
-`IRkernel` for R (worth the build cost — jsonyter's multi-session Org support
-is only meaningfully exercised with two languages live at once). IJulia is
-optional and slow to build; make it a build arg, default off. **SAS is not
-available** — every SAS scenario runs against the fake bridge, which is fine,
-because what the SAS scenarios test is jsonyter's handling of SAS's protocol
-misbehaviour, not SAS itself.
+If the package's real backend is cheap enough to bake into the image (a
+language runtime, an interpreter, a small daemon), a profile can start a
+real instance of it and run true end-to-end scenarios: the subprocess
+starts, the connection comes up, real output — including a real image, if
+the package renders one — arrives over the wire and rasterises in a frame.
+Keep a handful of these and accept that they are slower than scenarios
+against the fake (§9.2).
 
-The server starts on `127.0.0.1:8888` with a fixed token, and is reachable only
-from inside the container.
-
-Real-kernel scenarios are the end-to-end proof: the bridge subprocess starts,
-the websocket connects, a real `matplotlib` figure arrives as base64 PNG over
-the wire and rasterises in a frame. Keep a handful of these and accept that
-they are slower.
+Where a real backend isn't available at all (a proprietary system, a
+paid service, hardware), every scenario for it runs against the fake bridge
+instead — which is fine, because what those scenarios are testing is the
+package's handling of that backend's *protocol* and its failure modes, not
+the backend itself.
 
 ### 9.2 The fake bridge
 
-`eh-fake-bridge` is a Python script speaking the same line-oriented JSON
-protocol over stdin/stdout that the `jsonyter` package speaks. A profile points
-`jsonyter-command` at it:
+`eh-fake-bridge` is a small script speaking whatever line-oriented protocol
+the package's own backend process expects on stdin/stdout. A profile points
+the package's own "how do I launch my backend" option at it — illustrated
+here for the fictional `demo` package from §8.4:
 
 ```elisp
-(setq jsonyter-command (list "/opt/eh/bin/eh-fake-bridge"
-                             "--script" "/srv/profiles/jsonyter/bridge-scripts/streaming.jsonl"))
+(setq demo-backend-command (list "/opt/eh/bin/eh-fake-bridge"
+                                 "--script" "/srv/profiles/demo/bridge-scripts/streaming.jsonl"))
 ```
 
-It exists because a large class of jsonyter behaviour is **impossible or
-miserable to trigger against a real kernel**:
+It exists because a large class of backend-talking behaviour is
+**impossible or miserable to trigger against a real backend**:
 
-| Behaviour to test | Why a real kernel can't do it on demand |
+| Behaviour to test | Why a real backend can't do it on demand |
 | --- | --- |
-| `:offline` mode line — half-open websocket | Requires actually breaking the network mid-request |
-| `:dead` — kernel killed from another client | Racy, and destroys the session you were testing |
-| `:run[ext]` — busy on behalf of another client | Needs a second client attached at the right moment |
-| SAS's `is_complete` "incomplete for anything without a newline" | No SAS kernel |
-| SAS never answering `history`; answering `inspect` with `aborted` | Same |
-| `jsonyter-request-timeout` bounding a wedged request | Needs a kernel that hangs deliberately |
-| Streaming reconciliation ("the bridge repeats every streamed output in the final `outputs` list") | Needs byte-level control of the reply |
-| Exact ANSI tracebacks, exact mimebundle shapes | Kernel-version dependent |
-| A 200 MB image, a malformed mimebundle, invalid UTF-8 | Hostile inputs a kernel won't produce |
+| An "offline" mode-line state from a half-open connection | Requires actually breaking the network mid-request |
+| A "dead" state from the backend being killed by something else | Racy, and destroys the session you were testing |
+| "Busy on behalf of another client" | Needs a second client attached at the right moment |
+| A quirky real-world backend's specific protocol misbehaviour (e.g. a command that never replies, or answers with an error where a healthy backend wouldn't) | The real backend may not even be available in this environment |
+| A request-timeout setting bounding a wedged request | Needs a backend that hangs deliberately |
+| Streaming reconciliation (e.g. "the backend repeats every streamed chunk in its final combined reply") | Needs byte-level control of the reply |
+| Exact error-output formatting, exact payload shapes | Backend-version dependent |
+| An oversized payload, a malformed message, invalid UTF-8 | Hostile inputs a well-behaved backend won't produce |
 
 Script format — one JSON object per line, matched in order against incoming
 requests, with timed event emission:
 
 ```jsonl
-{"on":{"method":"start_kernel"},"reply":{"kernel_id":"k1"},"delay_ms":50}
+{"on":{"method":"start"},"reply":{"session_id":"k1"},"delay_ms":50}
 {"on":{"method":"execute","code":"~^for i in~"},
  "emit":[{"after_ms":0,   "event":"status","state":"busy"},
          {"after_ms":100, "event":"stream","name":"stdout","text":"step 1\n"},
@@ -918,27 +956,28 @@ requests, with timed event emission:
          {"after_ms":310, "event":"display_data","file":"fixtures/plot.png"},
          {"after_ms":400, "event":"status","state":"idle"}],
  "reply":{"outputs":["<repeat-all-emitted>"],"execution_count":1}}
-{"on":{"method":"history"},"never_reply":true}          // SAS emulation
-{"on":{"method":"is_complete"},"script":"sas"}          // named behaviour bundle
-{"at":"t+2000","inject":{"event":"status","state":"dead","kernel_id":"k1"}}
+{"on":{"method":"history"},"never_reply":true}          // a backend that never answers a given request
+{"on":{"method":"is_complete"},"script":"quirky-backend"} // named behaviour bundle
+{"at":"t+2000","inject":{"event":"status","state":"dead","session_id":"k1"}}
 ```
 
 Two features that make this genuinely useful rather than a toy:
 
-1. **Record mode.** `eh-fake-bridge --record out.jsonl -- <real bridge command>`
-   proxies stdin/stdout to the real bridge and writes a replayable script,
-   with image payloads spilled to files. Every fixture then starts as *real
-   traffic from a real kernel*, hand-edited afterwards. Building fixtures by
-   hand from the protocol spec is how fixtures end up subtly wrong and tests
-   end up passing against a fiction.
+1. **Record mode.** `eh-fake-bridge --record out.jsonl -- <real backend command>`
+   proxies stdin/stdout to the real backend and writes a replayable script,
+   with binary payloads spilled to files. Every fixture then starts as
+   *real traffic from a real backend*, hand-edited afterwards. Building
+   fixtures by hand from a protocol spec is how fixtures end up subtly
+   wrong and tests end up passing against a fiction.
 2. **A `--fault` flag** for the hostile cases: `--fault truncate-json`,
-   `--fault stderr-noise` (verifies the claim that "the bridge's stderr goes to
-   a hidden buffer so Python warnings cannot corrupt the JSON protocol on
+   `--fault stderr-noise` (verifies a claim like "the backend's stderr goes
+   to a hidden buffer so warnings on it cannot corrupt the protocol on
    stdout"), `--fault slow-drip`, `--fault die-mid-reply`.
 
 The fake bridge must be kept honest: one scenario runs the *same* script
-against both bridges where the real kernel can produce the same traffic, and
-compares the resulting snapshots. If they diverge, the fake has drifted.
+against both the real backend and the fake, where the real one can produce
+the same traffic, and compares the resulting snapshots. If they diverge,
+the fake has drifted.
 
 ---
 
@@ -1030,14 +1069,14 @@ the primary operator, so the operating discipline is part of the deliverable.
    the mode line — exactly, cheaply, and in a form you can diff. Take a
    screenshot only to answer "did this actually rasterise / lay out", or to
    show a human.
-3. **Never assert without waiting.** Every action that touches a kernel is
-   asynchronous. `eh wait <predicate>` or a named waiter, always. A test that
-   passes because a `sleep 2` happened to be long enough is a test that will
-   fail in CI.
-4. **Crop and scale screenshots.** `eh shot --region '(eh-cell-output-region 2)'
+3. **Never assert without waiting.** Every action that touches a subprocess
+   is asynchronous. `eh wait <predicate>` or a named waiter, always. A test
+   that passes because a `sleep 2` happened to be long enough is a test that
+   will fail in CI.
+4. **Crop and scale screenshots.** `eh shot --region '(eh-region-output-region 2)'
    --scale 0.5` instead of a full 1280×800 frame.
 5. **Drive with keys, not function calls.** `eh keys "C-c C-e"` exercises the
-   keymap, the command loop, and `last-command`; `eh eval '(jsonyter-notebook-run-cell)'`
+   keymap, the command loop, and `last-command`; `eh eval '(demo-run-region)'`
    exercises none of them and will pass while the binding is broken.
 6. **On failure, read the run directory.** Every failure writes
    `runs/<id>/<scenario>/` with screenshots, snapshots, `*Messages*`, the
@@ -1066,15 +1105,13 @@ Several of the assumptions this document makes are load-bearing and must be
 | `x-export-frames` really returns PNG bytes | export, check the 8-byte PNG magic, check size > 1 KB | a cairo build can still be built without the export |
 | pgtk or X11 | `(featurep 'pgtk)` | decides whether `xdotool` works (§13.1) |
 | `window-absolute-pixel-position` | call it on `(point-min)` in a visible window; assert a `(X . Y)` cons | the click path depends on its exact return shape; **verify per Emacs version**, 27.2 included |
-| image types | `(image-type-available-p 'png)`, `'svg`, `'jpeg` | jsonyter renders all three |
+| image types | `(image-type-available-p 'png)`, `'svg`, `'jpeg` | a profile may need any of these |
 | image scaling pinned | `image-scaling-factor` is `1.0`, not `auto` | §7.2 |
 | font resolved | `(font-get (face-attribute 'default :font) :name)` matches the pinned font | pixel baselines are meaningless otherwise |
 | frame geometry exact | `(frame-pixel-width)` / `(frame-pixel-height)` equal the requested values | WM interference |
 | xdotool reaches the frame | send `C-g`, confirm `(this-command-keys)` or a `keyboard-quit` in `*Messages*` | the `--x` input path |
-| Jupyter reachable | `GET /api/kernelspecs` with the token | real-kernel scenarios |
-| kernels present | list of kernelspecs; report which of python3/ir/julia/sas exist | drives `:needs` skipping |
-| `jsonyter` python package | `python3 -m jsonyter --version` | the real bridge |
-| fake bridge | round-trip one request | the fake bridge |
+| a profile's declared backend reachable, if any | whatever health check that service exposes | real-backend scenarios (§9.1) |
+| fake bridge | round-trip one request | the fake bridge (§9.2), for profiles that use one |
 | ImageMagick / ffmpeg | `convert -version`, `ffmpeg -version` | tier 3 |
 | writable run dir | touch a file in `/var/lib/eh/runs` | artifacts, and unRAID permission mapping |
 | clock is UTC | `date +%Z` | determinism |
@@ -1120,18 +1157,19 @@ bump silently switches it.
 | A scenario hangs Emacs in a minibuffer prompt | Prompt guard + SIGUSR2 escalation (§6.5). Non-negotiable; build it in phase 1. |
 | Pixel baselines drift on every base-image rebuild (font/freetype/cairo version bumps) | Pin the base image by digest. Keep baselines few (§8.3). Treat a mass baseline diff after a rebuild as expected, and review it once. |
 | `overlays-in` returns overlays in unspecified order | Sort deterministically in `eh-snapshot` (§6.2). This *will* cause phantom diffs if skipped. |
-| Kernel startup is slow and variable; SAS is ~17 s to first output by design | Generous `:needs`-aware timeouts; never a fixed sleep; keep real-kernel scenarios few. |
+| A real backend's startup is slow and variable (some backends are inherently slow to first output) | Generous `:needs`-aware timeouts; never a fixed sleep; keep real-backend scenarios few (§9.1). |
 | unRAID file ownership on the bind-mounted repo and run dir | Run the container with `--user $(id -u):$(id -g)` matching the host user, or set `PUID`/`PGID` the unRAID way. Getting this wrong leaves root-owned files in `~/git`. |
 | Container has network access to the internet | It does not need it at runtime. Build-time only; run with a restricted network, and never mount the real `~/.authinfo.d` or GPG keys. |
-| The RockPro64 (arm64, Alpine) as a host | Don't. IRkernel and Julia on arm64/musl are a build project of their own, and 4 GB of RAM will not host an Emacs matrix. Use unRAID; leave the RockPro64 for Bitwarden. |
+| The RockPro64 (arm64, Alpine) as a host | Don't. Some backends' language runtimes are a build project of their own on arm64/musl, and 4 GB of RAM will not host an Emacs matrix. Use unRAID; leave the RockPro64 for Bitwarden. |
 | Emacs 27.2 lacks `--init-directory` | Set `HOME` instead, on all versions (§7.1). |
-| jsonyter mounts and the notebook `.ipynb` fixtures share cell ids across scenarios | Fresh scratch dir per scenario (§8.2 teardown). |
+| A package's own fixtures share random ids across scenarios (common with formats whose id generation isn't scenario-aware) | Fresh scratch dir per scenario (§8.2 teardown). |
 | Frame export includes the cursor | `--no-cursor` (§6.4). |
 
 ### 13.3 Open questions for the implementer
 
-1. **How many Emacs versions in the default matrix?** The package claims 27.1+.
-   Suggest running 29.4 (or whatever Debian stable ships) on every scenario,
+1. **How many Emacs versions in the default matrix?** Packages commonly
+   claim a floor around 27.1+; whatever a given profile's package claims,
+   suggest running 29.4 (or whatever Debian stable ships) on every scenario,
    and the full matrix `{27.2, 28.2, 29.4, 30.2, 31.1}` nightly or on tags.
    Building five Emacsen from source makes a slow image; using distro packages
    across several base images makes five images. Recommend the latter:
@@ -1142,10 +1180,10 @@ bump silently switches it.
 3. **Should the snapshot format be stabilised as v1 immediately?** Yes — put
    `:version 1` in it from the first commit and treat it as an interface.
    Scenario files, baselines and agent habits all depend on it.
-4. **Where do baselines live?** In the harness repo under `profiles/jsonyter/`,
-   or in the jsonyter repo? Recommend the harness repo while the harness is
-   young (one place to review), with a documented move if the profile is later
-   vendored into jsonyter itself.
+4. **Where do baselines live?** In the harness repo under `profiles/<name>/`,
+   or in the package's own repo? Recommend the harness repo while the
+   harness is young (one place to review), with a documented move per
+   profile if that profile is later vendored into its own package's repo.
 
 ---
 
@@ -1169,13 +1207,13 @@ Container with Xvfb + openbox + a cairo GUI Emacs + `eh doctor`.
 path), `wait`, `settle`, `shot`; the prompt guard and hang recovery; the run
 directory and failure bundle; `eh run` executing ERT.
 
-**Done when:** `eh run jsonyter --scenario notebook-output-is-framed-and-read-only`
-passes against a real Python kernel, and deliberately breaking
-`jsonyter-output-border-face` produces a failure whose run directory contains a
+**Done when:** `eh run <profile> --scenario <name>` passes for a scenario
+that asserts a resolved face via `eh-expect-face`, and deliberately breaking
+that face's definition produces a failure whose run directory contains a
 screenshot, a snapshot, and a backtrace that names the face.
 
-Also in this phase: `eh run jsonyter --batch` runs the existing
-`test/jsonyter-tests.el` unchanged, so one command covers everything.
+Also in this phase: `eh run <profile> --batch` runs a profile's existing
+batch ERT suite unchanged, so one command covers everything.
 
 ### Phase 2 — input and pixels (2 days)
 
@@ -1192,9 +1230,10 @@ The profile abstraction extracted and proven; `profiles/smoke/`; the Emacs
 version matrix; `compose.yaml` and a GitHub Actions workflow running the same
 image headlessly.
 
-**Done when:** `eh run smoke` passes in an image built with **no** Python,
-Jupyter or jsonyter installed; and `eh run jsonyter --emacs 27.2,29.4` runs the
-same scenarios on both and reports per-version results.
+**Done when:** `eh run smoke` passes in an image built with **no**
+package-specific dependencies installed beyond what `smoke` itself needs
+(none); and `eh run <profile> --emacs 27.2,29.4` runs the same scenarios on
+both, for any profile, and reports per-version results.
 
 ### Phase 4 — the MCP server (1–2 days)
 
@@ -1265,8 +1304,7 @@ summary.txt          one line per scenario; the last line is the overall verdict
     frame.svg                       (text-searchable render, see §6.4)
     snapshot-<buffer>.el
     messages.log
-    jsonyter-stderr.log
-    jupyter.log.tail
+    <profile-declared log buffers/files, e.g. a backend's stderr>
     backtrace.txt
     video.mp4                       (if enabled)
     steps.jsonl                     every eh action with a timestamp
@@ -1296,4 +1334,3 @@ can quote it without parsing anything.
   <https://kasm.com/kasmvnc>
 - Prior art for the MCP shape: <https://github.com/keegancsmith/emacs-mcp-server>,
   <https://github.com/dangerzig/emacs-mcp>
-- The package under test: <https://github.com/EGuthrieWasTaken/jsonyter.el>
