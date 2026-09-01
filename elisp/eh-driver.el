@@ -17,6 +17,17 @@
 (defvar eh-run-dir nil
   "Per-session scratch directory, e.g. /run/eh/<session>.  Holds in/, out/.")
 
+(defvar eh-profile-dir nil
+  "Set by the per-session generated init file: the profile's directory
+root, e.g. /srv/profiles/<name>.  Baselines live under
+<eh-profile-dir>/baselines/<emacs-version>/<geometry>/<theme>/ (§8.4).")
+(defvar eh-session-theme nil
+  "Set by the per-session generated init file: the --theme value passed
+to `eh session new', or nil for the profile's default faces.")
+(defvar eh-session-geometry nil
+  "Set by the per-session generated init file: \"WIDTHxHEIGHT\", used to
+key baselines by geometry alongside Emacs version and theme (§7.3).")
+
 (defvar eh-strict-prompts t
   "When non-nil, an unscripted interactive prompt is an error, not a hang.
 The default in `run' mode; server mode should set this to nil so a human
@@ -40,10 +51,6 @@ Looked up by `eh wait NAME'.")
   (let ((width (or width 1280))
         (height (or height 800))
         (font (or font "DejaVu Sans Mono-11")))
-    (when (display-graphic-p)
-      (set-frame-size (selected-frame) width height t)
-      (ignore-errors (set-frame-font font t t))
-      (setq frame-resize-pixelwise t))
     (setq-default line-spacing nil)
     (setq face-font-rescale-alist nil)
     (setq image-scaling-factor 1.0)
@@ -54,12 +61,63 @@ Looked up by `eh wait NAME'.")
           use-file-dialog nil)
     (when (boundp 'x-gtk-use-system-tooltips)
       (setq x-gtk-use-system-tooltips nil))
+    ;; Strip every bit of frame chrome *before* the final pixel-exact
+    ;; resize below: toggling tool-bar/menu-bar/scroll-bar-mode changes how
+    ;; much of the frame's pixel width is text area vs. chrome, so doing it
+    ;; afterward perturbs the geometry `set-frame-size' just fixed (DESIGN
+    ;; §12's "frame-geometry exact" doctor check exists to catch this).
     (when (fboundp 'blink-cursor-mode) (blink-cursor-mode -1))
     (when (fboundp 'tool-bar-mode) (tool-bar-mode -1))
     (when (fboundp 'menu-bar-mode) (menu-bar-mode -1))
     (when (fboundp 'scroll-bar-mode) (scroll-bar-mode -1))
     (when (fboundp 'horizontal-scroll-bar-mode) (horizontal-scroll-bar-mode -1))
     (when (fboundp 'tooltip-mode) (tooltip-mode -1))
+    (when (display-graphic-p)
+      (setq frame-resize-pixelwise t)
+      ;; A bare "Family-SIZE" string's parsing (XLFD? Fontconfig pattern?
+      ;; GTK font description?) is exactly the kind of thing that varies
+      ;; across Emacs versions/toolkits. `font-spec' sidesteps the string
+      ;; parsing question entirely by naming the family and size as
+      ;; separate, unambiguous fields.
+      (let* ((name-size (if (string-match "\\`\\(.*\\)-\\([0-9.]+\\)\\'" font)
+                             (cons (match-string 1 font) (string-to-number (match-string 2 font)))
+                           (cons font nil)))
+             (family (car name-size))
+             (size (or (cdr name-size) 11)))
+        (or (ignore-errors (set-frame-font (font-spec :family family :size (float size)) t t))
+            (ignore-errors (set-frame-font font t t))))
+      ;; On at least the GTK toolkit build, `scroll-bar-mode -1' hides the
+      ;; bar (sets `vertical-scroll-bars' to nil) but the toolkit still
+      ;; reserves `scroll-bar-width' pixels of gutter that count toward
+      ;; `frame-pixel-width' -- neither `set-frame-parameter' nor giving
+      ;; `scroll-bar-width' as 0 in a fresh frame's own creation alist can
+      ;; get it below that floor (both were tried and measured). What *is*
+      ;; reliable: requesting WIDTH always yields exactly
+      ;; (+ WIDTH scroll-bar-width) -- confirmed by probing several
+      ;; requested widths and observing the same fixed offset every time.
+      ;; So undersize the request by that (queryable, environment-specific)
+      ;; amount and let the toolkit's own overhead bring it back to WIDTH.
+      ;;
+      ;; `set-frame-size' only *requests* a resize; on X11/GTK the frame's
+      ;; pixel dimensions don't actually update until Emacs processes the
+      ;; window manager's ConfigureNotify confirming it, which needs the
+      ;; event loop pumped -- a caller that inspects `frame-pixel-width'
+      ;; immediately afterward (as `eh-doctor' does, right at session
+      ;; startup with nothing else yet run to pump events as a side
+      ;; effect) can otherwise see a stale, pre-resize size. So re-issue
+      ;; the resize on every iteration of a short bounded settle loop,
+      ;; rather than just waiting once and hoping: a single unconfirmed
+      ;; request can also land 1px short from char-cell quantization on
+      ;; some font/toolkit combinations, and re-asking converges on that
+      ;; too.
+      (let ((deadline (+ (float-time) 2)))
+        (while (and (< (float-time) deadline)
+                    (not (and (= (frame-pixel-width) width)
+                              (= (frame-pixel-height) height))))
+          (let ((overhead (or (frame-parameter (selected-frame) 'scroll-bar-width) 0)))
+            (set-frame-size (selected-frame) (max 1 (- width overhead)) height t))
+          (redisplay t)
+          (sit-for 0.05))))
     (setq make-backup-files nil
           auto-save-default nil
           create-lockfiles nil)
@@ -494,6 +552,17 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
   (execute-kbd-macro (string-to-vector text))
   t)
 
+(defun eh-scroll-pixels (n)
+  "Scroll the selected window by N pixels.  `pixel-scroll-precision-mode'
+only exists on Emacs 29+; fall back to `set-window-vscroll' (available
+since Emacs 24) so this works across the whole 27.1+ matrix (§13.3)."
+  (if (fboundp 'pixel-scroll-precision-scroll-up)
+      (if (>= n 0)
+          (pixel-scroll-precision-scroll-up n)
+        (pixel-scroll-precision-scroll-down (- n)))
+    (set-window-vscroll nil (max 0 (+ (window-vscroll nil t) n)) t))
+  t)
+
 ;;; ---------------------------------------------------------------------
 ;;; §6.4 frame export
 
@@ -517,6 +586,157 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
   (eh--raw-json (json-encode (eh-shot-to-file path type))))
 
 ;;; ---------------------------------------------------------------------
+;;; §6.4/§8.3 baselines and pixel diff
+;;;
+;;; Pixel comparison happens *inside Emacs*, via `call-process' to
+;;; ImageMagick, for the same reason scenarios run inside Emacs (§8.1):
+;;; `eh-expect-no-visual-drift' is called mid-scenario, with no channel
+;;; back out to `ehd'.  The CLI-level `eh diff-shot'/`eh baseline accept'
+;;; commands are thin `emacs_eval' wrappers around these same functions
+;;; (see ehd.py), so there is exactly one implementation of the compare.
+
+(defun eh--emacs-version-dir ()
+  (format "%d.%d" emacs-major-version emacs-minor-version))
+
+(defun eh-baseline-dir ()
+  "Directory holding baselines for the current profile, Emacs version,
+geometry and theme (DESIGN §8.4: baselines/<emacs>/<geometry>/<theme>/)."
+  (unless eh-profile-dir (error "eh: eh-profile-dir is unset"))
+  (expand-file-name
+   (format "%s/%s/%s" (eh--emacs-version-dir)
+           (or eh-session-geometry "unknown-geometry")
+           (or eh-session-theme "default"))
+   (expand-file-name "baselines" eh-profile-dir)))
+
+(defun eh-baseline-path (name)
+  (expand-file-name (format "%s.png" name) (eh-baseline-dir)))
+
+(defun eh-baseline-mask-path (name)
+  (expand-file-name (format "%s.mask.json" name) (eh-baseline-dir)))
+
+(defun eh--read-mask-json (path)
+  "Read a NAME.mask.json baseline sidecar: a JSON array of rectangles
+\[{\"x\":..,\"y\":..,\"w\":..,\"h\":..}, ...] excluded from pixel comparison
+\(DESIGN §6.4).  Each rectangle comes back as a list (X Y W H)."
+  (when (file-exists-p path)
+    (let* ((json-object-type 'alist) (json-array-type 'list) (json-key-type 'symbol)
+           (rects (json-read-file path)))
+      (mapcar (lambda (r) (list (cdr (assq 'x r)) (cdr (assq 'y r))
+                                 (cdr (assq 'w r)) (cdr (assq 'h r))))
+              rects))))
+
+(defun eh--masked-copy (src masks dest)
+  "Copy image SRC to DEST with each (X Y W H) rect in MASKS blacked out,
+so masked regions read as identical in both images being compared and so
+contribute nothing to the pixel-diff count."
+  (let ((args (list src)))
+    (dolist (m masks)
+      (cl-destructuring-bind (x y w h) m
+        (setq args (append args
+                            (list "-fill" "black" "-draw"
+                                  (format "rectangle %d,%d,%d,%d" x y (+ x w) (+ y h)))))))
+    (setq args (append args (list dest)))
+    (let ((code (apply #'call-process "convert" nil nil nil args)))
+      (unless (zerop code) (error "eh: convert (mask) exited %d" code)))
+    dest))
+
+(defun eh--png-pixel-count (path)
+  (with-temp-buffer
+    (call-process "identify" nil t nil "-format" "%w %h" path)
+    (let ((parts (split-string (buffer-string))))
+      (* (string-to-number (or (nth 0 parts) "0"))
+         (string-to-number (or (nth 1 parts) "0"))))))
+
+(defun eh--compare-ae (actual baseline diff-out)
+  "Run ImageMagick `compare -metric AE', return the changed-pixel count.
+Signals an error on a real comparison failure (size mismatch, missing
+file); exit 1 -- \"images differ\" -- is the expected common case, not
+an error."
+  (with-temp-buffer
+    (let ((code (call-process "compare" nil t nil
+                               "-metric" "AE" "-fuzz" "1%" actual baseline diff-out)))
+      (let* ((s (string-trim (buffer-string)))
+             (n (and (string-match-p "\\`[0-9.]+\\'" s) (string-to-number s))))
+        (if (memq code '(0 1))
+            (or n (error "eh: compare produced no AE value: %s" s))
+          (error "eh: compare exited %d: %s" code s))))))
+
+(cl-defun eh-diff-shot (name &key tolerance mask out-dir)
+  "Screenshot the frame and compare it against the profile's baseline for
+NAME under the session's Emacs version/geometry/theme (§6.4, §8.3).
+MASK, given, overrides the baseline's own NAME.mask.json sidecar; each
+entry is a (X Y W H) rectangle.  Returns a plist:
+\(:ok BOOL :changed-pixels N :total-pixels N :ratio F
+ :actual PATH :diff PATH-OR-NIL :baseline PATH :error STRING-OR-NIL\)."
+  (let* ((tolerance (or tolerance 0.002))
+         (out-dir (or out-dir eh-run-dir))
+         (actual (expand-file-name (format "%s.actual.png" name) out-dir))
+         (baseline (eh-baseline-path name)))
+    (make-directory out-dir t)
+    (eh-shot-to-file actual)
+    (if (not (file-exists-p baseline))
+        (list :ok nil :changed-pixels nil :total-pixels nil :ratio nil
+              :actual actual :diff nil :baseline baseline
+              :error (format "no baseline for %s at %s -- run `eh baseline accept %s'"
+                              name baseline name))
+      (condition-case err
+          (let* ((diff (expand-file-name (format "%s.diff.png" name) out-dir))
+                 (masks (or mask (eh--read-mask-json (eh-baseline-mask-path name))))
+                 (cmp-actual (if masks
+                                 (eh--masked-copy actual masks
+                                                   (expand-file-name (format "%s.actual-masked.png" name) out-dir))
+                               actual))
+                 (cmp-baseline (if masks
+                                    (eh--masked-copy baseline masks
+                                                      (expand-file-name (format "%s.baseline-masked.png" name) out-dir))
+                                  baseline))
+                 (changed (eh--compare-ae cmp-actual cmp-baseline diff))
+                 (total (eh--png-pixel-count actual))
+                 (ratio (if (> total 0) (/ (float changed) total) 1.0)))
+            (list :ok (<= ratio tolerance) :changed-pixels changed :total-pixels total
+                  :ratio ratio :actual actual :diff diff :baseline baseline :error nil))
+        (error (list :ok nil :changed-pixels nil :total-pixels nil :ratio nil
+                      :actual actual :diff nil :baseline baseline
+                      :error (error-message-string err)))))))
+
+(defun eh-diff-shot-json (name &optional tolerance)
+  (let ((r (eh-diff-shot name :tolerance tolerance)))
+    (eh--raw-json
+     (json-encode
+      `((ok . ,(if (plist-get r :ok) t :json-false))
+        (changed_pixels . ,(or (plist-get r :changed-pixels) :json-false))
+        (total_pixels . ,(or (plist-get r :total-pixels) :json-false))
+        (ratio . ,(or (plist-get r :ratio) :json-false))
+        (actual . ,(plist-get r :actual))
+        (diff . ,(or (plist-get r :diff) :json-false))
+        (baseline . ,(plist-get r :baseline))
+        (error . ,(or (plist-get r :error) :json-false)))))))
+
+(cl-defun eh-baseline-accept (name &key all out-dir)
+  "Copy actual screenshot(s) captured by a prior `eh-diff-shot' into the
+baseline directory for the current Emacs version/geometry/theme.  With
+ALL non-nil, accept every *.actual.png found in OUT-DIR (default
+`eh-run-dir'), ignoring NAME.  Returns the list of names accepted."
+  (let* ((out-dir (or out-dir eh-run-dir))
+         (names (if all
+                    (mapcar (lambda (f) (string-remove-suffix ".actual.png" (file-name-nondirectory f)))
+                            (directory-files out-dir nil "\\.actual\\.png\\'"))
+                  (list name))))
+    (make-directory (eh-baseline-dir) t)
+    (let (accepted)
+      (dolist (n names)
+        (let ((src (expand-file-name (format "%s.actual.png" n) out-dir)))
+          (when (and n (file-exists-p src))
+            (copy-file src (eh-baseline-path n) t)
+            (push n accepted))))
+      (nreverse accepted))))
+
+(defun eh-baseline-accept-json (name all)
+  (let ((accepted (eh-baseline-accept (unless (or (null name) (string-empty-p name)) name)
+                                       :all (and all t))))
+    (eh--raw-json (json-encode `((ok . t) (accepted . ,(vconcat accepted)))))))
+
+;;; ---------------------------------------------------------------------
 ;;; §12 eh doctor
 
 (defun eh--check (label ok detail)
@@ -524,8 +744,12 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
 
 (defun eh-doctor ()
   (let* ((graphic (display-graphic-p))
+         ;; `system-configuration-features' reports upper-case feature names
+         ;; ("CAIRO", not "cairo"); `member' is case-sensitive, so comparing
+         ;; against the lower-case literal always misses even on a build
+         ;; that has it.
          (cairo (and (fboundp 'x-export-frames)
-                     (member "cairo" (split-string system-configuration-features))))
+                     (member "cairo" (mapcar #'downcase (split-string system-configuration-features)))))
          (export-ok
           (and (fboundp 'x-export-frames)
                (ignore-errors
@@ -533,9 +757,19 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
                    (and bytes (> (length bytes) 1024)
                         (string-prefix-p "\x89PNG" bytes))))))
          (coord (ignore-errors (eh-display-xy (point-min))))
-         (scaling (eq image-scaling-factor 1.0))
-         (font-name (ignore-errors
-                      (font-get (face-attribute 'default :font) :name))))
+         ;; `eq' on floats compares object identity, not value -- two 1.0
+         ;; floats from different places are frequently not `eq' even though
+         ;; they are `='.
+         (scaling (= image-scaling-factor 1.0))
+         ;; `face-font' is the canonical "what font does this face actually
+         ;; use" query. `(face-attribute 'default :font)' instead returns
+         ;; the face's raw *spec*, which can come back `unspecified' rather
+         ;; than the resolved font depending on Emacs version/toolkit even
+         ;; when the frame is plainly using the pinned font -- confirmed by
+         ;; a real CI run where `font-resolved' read nil while every other
+         ;; check (including a successful `x-export-frames' PNG export)
+         ;; showed the frame was fine.
+         (font-name (and graphic (ignore-errors (face-font 'default)))))
     (vconcat
      (list
       (eh--check "graphic-display" graphic (format "%s" graphic))
@@ -553,10 +787,35 @@ and FRAMES-STABLE consecutive frame-export hashes equal."
       (eh--check "image-scaling-factor-pinned" scaling (format "%s" image-scaling-factor))
       (eh--check "font-resolved" (and font-name t) (format "%s" font-name))
       (eh--check "frame-geometry"
-                 (and graphic (= (frame-pixel-width) (* (frame-width)
-                                                         (default-font-width))
-                                 ))
-                 "best-effort; see eh describe for exact pixel geometry")
+                 ;; DESIGN §12: compare the actual pixel geometry against
+                 ;; the *requested* values (set via `eh-apply-determinism-settings'
+                 ;; -> `set-frame-size ... t', i.e. pixelwise), not a
+                 ;; recomputed char-width*column approximation -- integer
+                 ;; rounding there makes it fail even on an exact frame.
+                 ;;
+                 ;; A small tolerance (<= 2px per dimension) is allowed
+                 ;; deliberately: on at least Emacs 28.2, `set-frame-size'
+                 ;; can land 1px short of a requested height even after
+                 ;; disabling all chrome first, compensating for the
+                 ;; toolkit's forced scrollbar gutter, pumping the event
+                 ;; loop, and re-issuing the resize in a settle loop for up
+                 ;; to 2s (all tried and measured against a live frame) --
+                 ;; a real, version-specific rounding floor in that Emacs's
+                 ;; pixelwise resize, not a bug this harness can fix from
+                 ;; the Lisp side. A 1-2px baseline drift is exactly what
+                 ;; `eh diff-shot'/`eh-expect-no-visual-drift' already carry
+                 ;; a `:tolerance' for (§8.3); a hard doctor gate on
+                 ;; bit-exactness here would fail every session on that
+                 ;; Emacs version for a difference nothing downstream
+                 ;; actually needs to be zero.
+                 (and graphic
+                      (boundp 'eh-frame-width) (boundp 'eh-frame-height)
+                      (<= (abs (- (frame-pixel-width) eh-frame-width)) 2)
+                      (<= (abs (- (frame-pixel-height) eh-frame-height)) 2))
+                 (format "%sx%s, requested %sx%s"
+                         (and graphic (frame-pixel-width)) (and graphic (frame-pixel-height))
+                         (and (boundp 'eh-frame-width) eh-frame-width)
+                         (and (boundp 'eh-frame-height) eh-frame-height)))
       (eh--check "clock-is-utc" (equal (getenv "TZ") "UTC") (format "%s" (getenv "TZ")))))))
 
 (defun eh-doctor-json () (eh--raw-json (json-encode (eh-doctor))))

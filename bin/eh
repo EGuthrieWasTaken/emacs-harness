@@ -157,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--xy", default=None)
     ck.add_argument("--button", type=int, default=1)
     ck.add_argument("--double", action="store_true")
+    ck.add_argument("--modifiers", default=None, help="comma-separated: ctrl,shift,alt,super,hyper")
 
     dr = sub.add_parser("drag")
     dr.add_argument("--from", dest="from_", required=True)
@@ -189,7 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     vd_sub = vd.add_subparsers(dest="action", required=True)
     vs = vd_sub.add_parser("start")
     vs.add_argument("--out", default=None)
-    vd_sub.add_parser("stop")
+    vstop = vd_sub.add_parser("stop")
+    vstop.add_argument("--gif", action="store_true")
 
     ds = sub.add_parser("diff-shot")
     ds.add_argument("name")
@@ -205,6 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("profile")
     rn.add_argument("--scenario", action="append", default=[])
     rn.add_argument("--tag", default=None)
+    rn.add_argument("--emacs", default=None, help="comma-separated Emacs binaries/versions to run the matrix over")
     rn.add_argument("--batch", action="store_true")
     rn.add_argument("--reuse-session", action="store_true")
     rn.add_argument("--junit", default=None)
@@ -240,7 +243,8 @@ def to_request(args) -> dict:
     elif cmd == "click":
         a = dict(at_point=args.at_point, at=args.at, at_text=args.at_text,
                   xy=[int(v) for v in args.xy.split(",")] if args.xy else None,
-                  button=args.button, double=args.double)
+                  button=args.button, double=args.double,
+                  modifiers=args.modifiers.split(",") if args.modifiers else None)
     elif cmd == "drag":
         a = dict(**{"from": args.from_}, to=args.to)
     elif cmd == "scroll":
@@ -256,14 +260,18 @@ def to_request(args) -> dict:
         a = dict(out=args.out, display=args.display)
     elif cmd == "video":
         cmd = f"video-{args.action}"
-        a = dict(out=getattr(args, "out", None))
+        a = dict(out=getattr(args, "out", None), gif=getattr(args, "gif", False))
     elif cmd == "diff-shot":
         a = dict(name=args.name, tolerance=args.tolerance)
     elif cmd == "baseline":
         cmd = f"baseline-{args.action}"
-        a = dict(name=args.name)
+        if args.action == "accept" and not args.name and not args.all:
+            print("eh baseline accept: need NAME or --all", file=sys.stderr)
+            sys.exit(EXIT_USAGE)
+        a = dict(name=args.name, all=args.all)
     elif cmd == "run":
         a = dict(profile=args.profile, scenario=args.scenario, tag=args.tag,
+                  emacs=args.emacs.split(",") if args.emacs else None,
                   batch=args.batch, reuse_session=args.reuse_session)
     elif cmd == "logs":
         a = dict(service=args.service, tail=args.tail)
@@ -286,11 +294,23 @@ def render(args, resp: dict) -> None:
             print(f"[{mark}] {c['check']:<32} {c.get('detail', '')}")
         print("ALL GREEN" if resp.get("ok") else "DOCTOR FOUND PROBLEMS")
     elif cmd == "run":
-        summary = resp.get("summary", {})
-        for t in summary.get("tests", []):
-            print(f"{t['status'].upper():8s} {t['name']}")
-        if "run_dir" in resp:
-            print(resp["run_dir"])
+        if "matrix" in resp:
+            for version, r in resp["matrix"].items():
+                label = version or "default"
+                summary = r.get("summary", {})
+                for t in summary.get("tests", []):
+                    print(f"[{label}] {t['status'].upper():8s} {t['name']}")
+                verdict = "OK" if r.get("ok") else "FAIL"
+                print(f"[{label}] {verdict}"
+                      + (f" -- {r['error'].get('message', '')}" if r.get("error") else ""))
+                if "run_dir" in r:
+                    print(f"[{label}] {r['run_dir']}")
+        else:
+            summary = resp.get("summary", {})
+            for t in summary.get("tests", []):
+                print(f"{t['status'].upper():8s} {t['name']}")
+            if "run_dir" in resp:
+                print(resp["run_dir"])
     elif cmd == "eval":
         if "value" in resp:
             print(resp["value"])

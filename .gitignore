@@ -1,6 +1,10 @@
 # Created by https://www.toptal.com/developers/gitignore/api/emacs,macos,linux,windows,elisp
 # Edit at https://www.toptal.com/developers/gitignore?templates=emacs,macos,linux,windows,elisp
 
+### Python (ehd/, bin/eh) ###
+__pycache__/
+*.pyc
+
 ### Elisp ###
 # Compiled
 *.elc

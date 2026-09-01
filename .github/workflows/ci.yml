@@ -1,0 +1,42 @@
+name: CI
+
+# DESIGN.md §14 phase 3: "compose.yaml and a GitHub Actions workflow
+# running the same image headlessly. Done when: `eh run smoke` passes in
+# an image built with no package-specific dependencies installed."
+#
+# Xvfb, openbox, and Emacs all run *inside* the container (ehd's session
+# manager starts them), so this workflow needs nothing beyond `docker
+# build`/`docker run` on the runner -- no xvfb-run wrapper, no display
+# server on the host.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f container/Dockerfile -t emacs-harness:ci .
+
+      - name: eh doctor
+        run: |
+          mkdir -p runs
+          docker run --rm --shm-size=1gb -v "$PWD/runs:/var/lib/eh/runs" emacs-harness:ci doctor
+
+      - name: eh run smoke
+        run: docker run --rm --shm-size=1gb -v "$PWD/runs:/var/lib/eh/runs" emacs-harness:ci run smoke
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-run-artifacts
+          path: runs/
+          if-no-files-found: ignore
+          retention-days: 14

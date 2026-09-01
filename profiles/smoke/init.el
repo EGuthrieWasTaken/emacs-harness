@@ -15,8 +15,8 @@
 Uses `with-silent-modifications': a face applied to *read output*, say,
 is decoration, not a user edit, and must not dirty the buffer or push
 an undo entry -- exactly the property this harness exists to assert on
-(DESIGN.md's jsonyter example: \"cell output ... written without
-touching undo or the modified flag\")."
+(DESIGN.md §1: buffer regions that are \"text but read-only, written
+without touching undo or the modified flag\")."
   (interactive)
   (goto-char (point-min))
   (when (search-forward "SMOKE-MARKER" nil t)
