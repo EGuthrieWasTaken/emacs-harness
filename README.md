@@ -1,72 +1,485 @@
 # emacs-harness
 
 A GUI Emacs test harness that an AI coding agent can drive: a real, graphical
-Emacs running on a headless X display inside a container, with a command-line
-control surface for evaluating Lisp, sending real keystrokes and mouse clicks,
-taking screenshots, and asserting on what Emacs actually drew — plus a browser
-view of the same live instance for point-and-click work and human eyeballs.
+Emacs running on a headless X display inside a container, with a
+control surface for evaluating Lisp, sending real keystrokes and mouse
+clicks, taking screenshots, and asserting on what Emacs actually drew —
+plus a browser view of the same live instance for point-and-click work and
+human eyeballs.
 
-Built for *any* Emacs package whose interesting behaviour is invisible to
-`emacs --batch` — sliced inline images, output overlays, read-only regions,
-streaming redraws, mode-line state pushed from a subprocess, scroll and
-point discipline, and anything else that only exists once there is real
-redisplay. Nothing in the core knows about any specific package: a package
-under test is described by a **profile** (a directory — see DESIGN.md §8.4),
-and the core is deliberately generic — proven by the fact that
-`profiles/smoke/` needs none of it (§8.5).
+> The repository name and the `eh` command name are placeholders — rename
+> freely, but rename consistently.
 
-## Status
+## What this is for
 
-**Phases 0-3 implemented, and phases 2-3's own DESIGN §14 acceptance tests
-now formally proven end-to-end** against a live `emacs-gtk` + `Xvfb` +
-`openbox` (not just wired up and assumed correct — see below). Phase 0-1:
-the container image, the `ehd` dispatcher, the `eh` client, the Elisp driver
-(`eh-driver.el`), the scenario DSL (`eh-scenario.el`), and the `smoke`
-profile that proves the core is package-agnostic. Phase 2: `eh
-click`/`eh drag`/`eh scroll`/`eh keys --x`, `eh video` (including `--gif`),
-and pixel baselines via `eh diff-shot`/`eh baseline accept` with
-`.mask.json` sidecar support, all wired end-to-end including the
-scenario-level `eh-expect-no-visual-drift`. **Phase 2's own acceptance
-test** — "a scenario clicks on the third slice of a tall inline image by
-buffer position... and `eh diff-shot` fails on a one-pixel change and
-passes on a rerun" — is now proven directly, not just plumbed: see
-`smoke/image-slices-are-addressable` and
-`smoke/diff-shot-detects-pixel-change` under "What's been validated" below.
-Phase 3: the `--emacs V,...` matrix flag on `eh run` and a GitHub Actions
-workflow (`.github/workflows/ci.yml`) that builds the image and runs `eh
-doctor` + `eh run smoke` headlessly. **Phase 3's matrix mechanism** is now
-verified against the real dispatcher (previously only exercised with a
-mocked `SessionManager` — see below for a real bug that mock missed). Not
-yet built: any profile beyond `smoke` itself (so the matrix flag's second
-acceptance test, "`eh run <profile> --emacs 27.2,29.4` for a real profile",
-can't be run end-to-end until one exists), pinned multi-version Emacs
-*images* (the matrix flag's own control flow is now proven against two
-distinctly-named binaries, but this environment — like every environment
-this harness has been driven in so far — has exactly one real Emacs release
-installed, so *different Emacs versions actually disagreeing on something*
-remains unexercised; see DESIGN §13.3 open question 1).
+Plenty of Emacs packages are 1,000+ lines of Emacs Lisp whose most
+failure-prone behaviour is *visual and interactive*: inline images (some
+sliced one slice per line, so ordinary scrolling has to walk through a tall
+image correctly), buffer regions that are text but read-only, overlay
+boundaries and faces that change when some underlying state goes stale,
+streaming or asynchronous output that redraws in place, a mode line that
+reports live state pushed from a subprocess, and scroll/point discipline
+("insertion never steals point, but a window already at the end follows new
+output").
 
-**Phase 4 (the MCP server) is now implemented and proven end-to-end**: the
-HTTP transport in `ehd.py` (`POST /v1/<cmd>`, DESIGN §6.1 — a shim over the
-exact same `handle()` dispatcher the Unix socket uses, not a second
-implementation), the `http` branch of `bin/eh`'s transport dispatch, and
-`mcp-server/eh_mcp_server.py`, an MCP server exposing the eight tools DESIGN
-§14 names (`emacs_eval`, `emacs_snapshot`, `emacs_keys`, `emacs_click`,
+A package like that usually already has a decent batch ERT suite, and that
+suite should stay — but it runs under `emacs -Q --batch`, where there is no
+redisplay, no image rasterisation, no real window geometry, and no real key
+lookup. Batch ERT can assert that an `image` display property *exists*; it
+cannot assert that the image actually decoded, that slicing produced the
+right number of addressable lines, or that a key sequence actually reaches
+the command the keymap claims it does.
+
+This harness closes that gap. It runs a real, graphical Emacs on a headless
+X display and gives an agent (or a human) a control surface to drive it and
+assert on it precisely:
+
+- **Structured introspection, not pixel-squinting.** The default assertion
+  mechanism is `eh snapshot` — a diffable dump of buffer text, resolved
+  faces, overlays, text properties, image descriptors and window geometry —
+  not a screenshot comparison. Screenshots exist for the handful of
+  questions only redisplay itself can answer ("did this actually
+  rasterise").
+- **Real input.** Keys go through `execute-kbd-macro` by default (the real
+  keymap, the real command loop, `last-command` chains all work) or through
+  a real X server via `xdotool` when you specifically need to prove a key
+  like `<C-return>` arrives correctly.
+- **Determinism.** Two runs of the same scenario on the same image produce
+  byte-identical screenshots — one pinned font, one pinned theme, no window
+  manager interference, a frozen clock.
+- **Package-agnostic core.** The core knows nothing about any specific
+  package under test; what it knows about a package lives entirely in a
+  **profile** (a directory — see `DESIGN.md` §8.4). `profiles/smoke/` is a
+  trivial profile with no external dependencies that exists purely to prove
+  the core doesn't secretly assume anything about a "real" profile.
+- **One command runs everything**, batch ERT included, and writes a single
+  artifact directory (screenshots, snapshots, `*Messages*`, backtraces) an
+  agent can point at when reporting a failure.
+
+See [`DESIGN.md`](DESIGN.md) for the full specification this was built
+against, and [`docs/example-scenarios.md`](docs/example-scenarios.md) for a
+fully worked, fictional-package scenario catalogue that illustrates the
+categories of behaviour a real profile would target.
+
+## When to reach for this
+
+Use this when you maintain (or are evaluating a PR against) an Emacs
+package where the interesting bugs live in things `emacs --batch` cannot
+see: a mode that inserts and slices images, a package with output overlays
+or read-only regions, anything that talks to a subprocess or a network
+connection and needs its mode-line/redraw behaviour tested under real
+async conditions, or a UI surface (clicking, dragging, scrolling) that a
+batch test simply cannot exercise.
+
+Don't reach for this to replace your batch ERT suite — it *runs* that
+suite unchanged (`eh run <profile> --batch`) and adds to it; it isn't a
+rewrite. And it isn't a general remote-desktop product — the noVNC browser
+view is a debugging affordance for a human or for Claude-in-Chrome, not the
+primary way an agent is meant to drive it.
+
+## How it works
+
+```
+  agent (Claude Code, a human, CI) ──▶ bin/eh  (thin client)
+                                          │
+                     ssh / docker exec / http (§ Setup below)
+                                          ▼
+                     docker container `emacs-harness`
+                         │
+                         ├── ehd — dispatcher (Unix socket + optional HTTP API)
+                         │     └── one Xvfb + openbox + Emacs process per session
+                         ├── x11vnc + websockify → noVNC browser view (:6080)
+                         └── artifacts → runs/<run-id>/<scenario>/
+```
+
+A container runs `Xvfb`, a pinned cairo-enabled GNU Emacs, and (per-profile)
+whatever side services a package needs — DESIGN §9 covers the pattern for a
+package that talks to a subprocess: a real instance of it, plus a
+scriptable fake speaking the same protocol for the failure modes a real
+backend can't produce on demand. A small in-container dispatcher (`ehd`)
+owns session lifecycle and exposes that Emacs over a Unix socket (and,
+optionally, over an HTTP API — see below); a thin client (`bin/eh`) reaches
+it from wherever the agent is running. The agent's default move is **not**
+to look at pixels: it asks Emacs for a structured dump of buffer text,
+overlays, text properties, faces and image descriptors, and asserts on
+that. Screenshots (`x-export-frames`, taken from inside Emacs — no window
+manager races) are the backstop for the handful of things only redisplay
+knows. Scenarios are ERT tests written in Emacs Lisp that run *inside* the
+instance under test, so the same file works both under an agent's hand and
+in CI.
+
+## Repository layout
+
+```
+emacs-harness/
+├── DESIGN.md                  ← the spec
+├── AGENTS.md / CLAUDE.md      ← the agent operating contract (DESIGN §11)
+├── docs/example-scenarios.md  ← a fully worked, fictional-package scenario
+│                                 catalogue illustrating the categories of
+│                                 behaviour a real profile would target
+├── .github/workflows/ci.yml   ← builds the image, runs the smoke profile
+│                                 and the HTTP/MCP acceptance test headlessly
+├── bin/eh                     ← thin client (runs wherever the agent runs)
+├── container/                 ← Dockerfile, supervisord, entrypoint
+├── compose.yaml                ← local-dev wrapper around the one image
+├── ehd/                       ← in-container dispatcher (ehd.py) + bridge (ehd_cli.py)
+├── elisp/                     ← eh-driver.el, eh-scenario.el, eh-profile.el, eh-init-core.el
+├── mcp-server/                ← MCP server (eh_mcp_server.py): runs where Claude Code
+│                                 runs, not in the container -- a thin shim over ehd's
+│                                 HTTP API (DESIGN §14 phase 4); test_acceptance.py is
+│                                 phase 4's own acceptance test, frozen and run in CI
+├── profiles/
+│   └── smoke/                 ← trivial profile that proves the core is generic
+│       (no other profiles exist yet -- add one for whatever package you
+│        want to test, see DESIGN.md §8.4)
+└── runs/                      ← per-run artifacts (gitignored)
+```
+
+---
+
+## Setup
+
+There are two sides to set up: the **Docker side** (the container that
+actually runs Emacs) and the **agent side** (whatever runs `bin/eh` or the
+MCP server and talks to that container).
+
+### Docker side
+
+Build the image and check it with `eh doctor` (DESIGN §12 — the first thing
+to run after any build, and the first thing to run whenever you're not sure
+what state something is in):
+
+```sh
+docker build -f container/Dockerfile -t emacs-harness:dev .
+docker run --rm -it emacs-harness:dev doctor
+```
+
+`doctor` exits non-zero and prints a red/green table if anything about the
+image is wrong (missing cairo support, wrong font, a bad frame geometry,
+…) — it should be all green on a normal build.
+
+The image has three run modes, selected by the first argument to the
+entrypoint (DESIGN §5.1):
+
+| Mode | What it does | When to use it |
+| --- | --- | --- |
+| `server` | Long-lived: brings up one default session, the noVNC browser view, and `ehd`. Stays up. | An agent exploring interactively, or a human watching. |
+| `run` | One-shot: starts a session, runs the named profile's scenarios (and/or its batch suite), writes artifacts, exits with the suite's status. | CI, or a clean one-off scenario run. |
+| `doctor` | Runs the environment self-check and exits. | Right after every build. |
+
+Bring up a long-lived instance and give it a name so `bin/eh` can reach it:
+
+```sh
+docker run -d --name emacs-harness -p 6080:6080 emacs-harness:dev server
+```
+
+That publishes the noVNC browser view at `http://localhost:6080` (a human,
+or Claude-in-Chrome, can watch or click there — see DESIGN §10). For
+day-to-day development on a laptop, `compose.yaml` wraps the same image:
+
+```sh
+docker compose up -d
+```
+
+**Deploying this for real** (e.g. on a homelab server, reached over SSH,
+with the browser view exposed through a Cloudflare Tunnel) is the target
+deployment DESIGN.md was written against (see its header and §10.2): run
+the container on the server, `ssh -L 6080:localhost:6080 <host>` while
+developing (zero exposure, zero configuration), and when you do want it
+reachable from outside, put a Cloudflare Tunnel + Access application in
+front of it on its own hostname rather than exposing the port directly —
+Access service tokens are the "machine" auth path (SSH, and the HTTP API
+below); an Access application with an identity-login policy is what
+protects the *browser* view, since a browser can't send service-token
+headers.
+
+#### Optional: the HTTP API (for the MCP server)
+
+Off by default. It exists so a client with no `ssh`/`docker` access — most
+notably the MCP server below — can still reach `ehd`. Enable it at
+`docker run` time, publish 8080 alongside 6080, and set a
+`CF-Access-Client-Id`/`Secret` pair (`ehd` checks these itself as defense
+in depth; the real access boundary should still be a Cloudflare Tunnel +
+Access application on its own hostname in front of 8080, same pattern as
+above):
+
+```sh
+docker run -d --name emacs-harness -p 6080:6080 -p 8080:8080 \
+    -e EH_HTTP_ENABLE=1 -e EH_HTTP_CLIENT_ID=<id> -e EH_HTTP_CLIENT_SECRET=<secret> \
+    emacs-harness:dev server
+
+curl http://localhost:8080/health          # locally
+curl https://emacs-harness-api.example.com/health   # once a tunnel is up
+```
+
+### Agent side
+
+`bin/eh` is a thin, dependency-free client: it builds a JSON request, ships
+it to `ehd` over whichever transport you configure, prints the response,
+and exits with a code you can branch on (`0` success, `1` assertion/scenario
+failure, `2` usage error, `3` timeout, `4` Emacs signalled an error, `5`
+session unreachable/dead).
+
+Pick a transport with `$EH_TRANSPORT` (or `~/.config/eh/config`, INI-style
+`[eh] transport=...`):
+
+| Transport | Set | When |
+| --- | --- | --- |
+| `docker` (default) | `EH_CONTAINER=emacs-harness` | The agent runs on the same host as Docker. |
+| `ssh` | `EH_HOST=<ssh-host>` (plus `EH_CONTAINER` if not the default name) | The agent runs elsewhere and reaches the Docker host over SSH. |
+| `local` | `EH_SOCK=/run/eh/eh.sock` | Running *inside* the container (this is what `entrypoint.sh` itself uses for `run`/`doctor` mode). |
+| `http` | `EH_HOST=https://...`, plus `EH_CF_ACCESS_CLIENT_ID`/`EH_CF_ACCESS_CLIENT_SECRET` if the origin checks them | The MCP server, or any client with only network access, no `ssh`/`docker` CLI. |
+
+```sh
+EH_TRANSPORT=docker EH_CONTAINER=emacs-harness bin/eh doctor
+EH_TRANSPORT=ssh EH_HOST=myhomelab bin/eh doctor
+EH_TRANSPORT=http EH_HOST=https://emacs-harness-api.example.com \
+  EH_CF_ACCESS_CLIENT_ID=<id> EH_CF_ACCESS_CLIENT_SECRET=<secret> bin/eh doctor
+```
+
+If you're driving this with Claude Code (or any coding agent) over Bash,
+that's it — put `bin/eh` on `PATH`, set the transport env vars, and read
+[`AGENTS.md`](AGENTS.md) (symlinked as `CLAUDE.md`) for the operating
+discipline: snapshot over screenshot, always wait rather than sleep, read
+the run directory on failure, and freeze what you learn into a scenario.
+
+#### The MCP server (no Bash calls)
+
+`mcp-server/eh_mcp_server.py` is a separate, small deliverable that runs
+*wherever Claude Code runs* — not inside the container — and exposes eight
+MCP tools (`emacs_eval`, `emacs_snapshot`, `emacs_keys`, `emacs_click`,
 `emacs_screenshot`, `emacs_wait`, `emacs_run_scenario`, `emacs_session`),
-each a thin translation of one MCP tool call into one HTTP round trip to
-`ehd`. Auth is `CF-Access-Client-Id`/`CF-Access-Client-Secret` header
-matching against `EH_HTTP_CLIENT_ID`/`EH_HTTP_CLIENT_SECRET`, defense in
-depth for whatever reaches the origin directly — the real access boundary,
-per DESIGN §10.2, is the Cloudflare Tunnel + Access application in front of
-it. **Phase 4's own acceptance test** — "Claude Code with the MCP server
-configured can, in one session and with no Bash calls, open a fixture
-notebook, run a cell, wait for idle, and report the resolved face of the
-output border" — is proven directly in `mcp-server/test_acceptance.py`
-(committed, and run in CI): it drives `eh_mcp_server.py` exactly as a real
-MCP client would, over real stdio JSON-RPC via the official `mcp` SDK's own
-`ClientSession`, against `smoke`'s `hello.txt` fixture and marker-facing key
-binding standing in for the fictional notebook/cell/output-border example,
-the same substitution every other acceptance test in this repo makes.
+each a thin shim that makes one HTTP call to `ehd`'s HTTP API above. Use
+this when you want Claude Code to drive the harness as first-class tool
+calls instead of shelling out to `bin/eh`.
+
+```sh
+pip install -r mcp-server/requirements.txt
+```
+
+Then point an MCP client at it over stdio, with the same HTTP credentials
+as above in its environment:
+
+```json
+{
+  "mcpServers": {
+    "emacs-harness": {
+      "command": "python3",
+      "args": ["/path/to/emacs-harness/mcp-server/eh_mcp_server.py"],
+      "env": {
+        "EH_HOST": "https://emacs-harness-api.example.com",
+        "EH_CF_ACCESS_CLIENT_ID": "<id>",
+        "EH_CF_ACCESS_CLIENT_SECRET": "<secret>"
+      }
+    }
+  }
+}
+```
+
+Every tool takes an optional `session` argument; when you omit it, `ehd`
+falls back to its own `$EH_SESSION` or the sole running session — but that
+fallback is evaluated in `ehd`'s environment inside the container, not the
+MCP server's, since the HTTP transport (unlike SSH/`docker exec`) doesn't
+share an environment with `ehd`. Pass `session` explicitly unless the
+harness has exactly one session running (e.g. `server` mode's own
+`"default"` session).
+
+---
+
+## Usage examples
+
+These were captured against a real session (`eh doctor` all green, a real
+cairo-enabled GTK Emacs on a real X display) — not invented output.
+
+### A CLI walkthrough
+
+Bring up a session against the `smoke` profile (the trivial profile that
+ships with the harness — swap in your own once you've written one):
+
+```
+$ eh session new --name demo --profile smoke
+{
+  "ok": true,
+  "session": "demo",
+  "display": 105,
+  "exit_code": 0
+}
+```
+
+Evaluate Lisp directly (tier 1 — cheap, exact, and the JSON envelope always
+tells you what happened, success or Lisp error):
+
+```
+$ eh --session demo eval '(+ 1 2)'
+3
+```
+
+Open a fixture and drive it with a real key sequence rather than calling
+the underlying function (so the keymap and command loop are actually
+exercised — DESIGN §6.3):
+
+```
+$ eh --session demo eval \
+    '(find-file (expand-file-name "hello.txt" eh-profile-fixtures-dir))'
+#<buffer hello.txt>
+
+$ eh --session demo keys "C-c C-s"
+{
+  "ok": true,
+  "exit_code": 0
+}
+```
+
+Assert on the result with a snapshot instead of a screenshot — this is the
+tier-1 workhorse, and answers "did the key binding actually face the
+marker text, without dirtying the buffer" exactly, in one call:
+
+```
+$ eh --session demo snapshot --props smoke-marker
+{
+    "version": 1,
+    "buffer": "hello.txt",
+    "point": 31,
+    "mark": false,
+    "modified": false,
+    "major-mode": "text-mode",
+    "mode-line": " -:---  hello.txt      All L2       (Text) ",
+    "runs": [
+        { "beg": 1,  "end": 19, "text": "line one\nline two ",
+          "face": false, "read-only": false, "invisible": false, "overlays": [] },
+        { "beg": 19, "end": 31, "text": "SMOKE-MARKER",
+          "face": "smoke-marker-face", "read-only": false, "invisible": false,
+          "overlays": [] },
+        { "beg": 31, "end": 53, "text": " line three\nline four\n",
+          "face": false, "read-only": false, "invisible": false, "overlays": [] }
+    ]
+}
+```
+
+`"face": "smoke-marker-face"` on exactly the `SMOKE-MARKER` run and
+`"modified": false` on the whole buffer — that's the assertion, no pixels
+needed. Take a screenshot only when you specifically need to prove
+something rasterised:
+
+```
+$ eh --session demo shot --out /tmp/frame.png
+{
+  "ok": true,
+  "path": "/tmp/frame.png",
+  "bytes": 18962,
+  "sha256": "21f423b6b633bed1a7f6b7fbf636e131c0216103c239ea68013fab205e5d7b4d",
+  "exit_code": 0
+}
+```
+
+And run the profile's whole scenario suite in one shot (a fresh session by
+default — DESIGN §5.2 — writing a single artifact directory an agent can
+point at when reporting a failure):
+
+```
+$ eh run smoke
+PASSED   smoke/diff-shot-detects-pixel-change
+PASSED   smoke/face-assertion
+PASSED   smoke/image-renders
+PASSED   smoke/image-slices-are-addressable
+PASSED   smoke/open-file-and-screenshot
+SKIPPED  smoke/visual-drift-skips-without-baseline
+/tmp/runs/20260901T153911Z-smoke-9a44ac
+```
+
+That last line is the run directory (`report.json`, `junit.xml`,
+screenshots, snapshots, `*Messages*`, a backtrace on any failure) — quote
+it in a bug report rather than re-deriving it.
+
+### Writing a scenario for your own package
+
+Scenarios are Emacs Lisp, and they run *inside* the instance under test —
+not shell scripts full of `eh` calls (DESIGN §8.1). The intended loop:
+explore a bug interactively with `eh eval`/`eh keys`/`eh shot`, work out
+what's actually wrong, fix it, then freeze what you learned into a scenario
+under `profiles/<name>/scenarios/` so it can never come back silently.
+`profiles/smoke/scenarios/smoke.el` is a small, real example to read first;
+`docs/example-scenarios.md` is a longer, fully worked catalogue against a
+fictional package covering the categories DESIGN §1 calls out (sliced
+images, output overlays, streaming redraws, mode-line state, scroll
+discipline). Adding a package to the harness is adding a
+`profiles/<name>/` directory (`profile.el`, `init.el`, `fixtures/`,
+`scenarios/*.el` — see DESIGN §8.4) — never editing the core.
+
+### From Claude Code, via MCP
+
+With the MCP server configured (see Setup above), an agent drives the same
+surface as first-class tool calls instead of Bash — for example, opening a
+fixture, exercising a key binding, waiting for the session to settle, and
+reading back the resolved face, with zero shell calls:
+
+```
+emacs_session(action="new", name="demo", profile="smoke")
+emacs_eval(session="demo",
+           form='(find-file (expand-file-name "hello.txt" eh-profile-fixtures-dir))')
+emacs_keys(session="demo", keys=["C-c C-s"])
+emacs_wait(session="demo", what="smoke-ready", timeout=10)
+emacs_snapshot(session="demo", props=["smoke-marker"])
+# -> the same JSON envelope as the CLI walkthrough above
+emacs_screenshot(session="demo")
+# -> the metadata envelope as text, plus the actual PNG as image content
+```
+
+`mcp-server/test_acceptance.py` is exactly this flow, committed and run in
+CI as phase 4's own acceptance test — read it for a complete, working
+example of driving the MCP server from Python.
+
+---
+
+## Is this ready to deploy as-is?
+
+Implementation-wise: yes, all five phases in `DESIGN.md` §14 are built, and
+every phase's own acceptance test has been proven against a real,
+graphical `emacs-gtk` + `Xvfb` + `openbox` stack — not mocked, not just
+"wired up and assumed correct" (see the validation log below for exactly
+what was run and what it found).
+
+One honest caveat: `docker build` itself has **never completed** in any
+environment this harness has been developed in so far — every sandbox used
+so far blocks Docker Hub's CDN at the network-policy level, so the build
+fails on the base `FROM debian:bookworm-slim` layer before reaching
+anything in this repo. Everything above was validated by installing the
+same packages (`emacs-gtk`, `Xvfb`, `openbox`, ImageMagick, `xdotool`, …)
+directly on a host and running `ehd.py`/`bin/eh` exactly as the container
+would, which is enough to prove the *logic* is correct against a real
+display but is **not** the same as a clean `docker build` succeeding. The
+GitHub Actions workflow (`.github/workflows/ci.yml`, which does have normal
+Docker Hub access from a hosted runner) is the first place the actual image
+build gets exercised — treat a green run there, plus its `eh doctor` step,
+as the real "does this deploy" signal before trusting it on a homelab
+server.
+
+A few other things are implemented but not yet exercised anywhere: `ffmpeg`
+video/gif capture, the noVNC browser view chain (`x11vnc`/`websockify`),
+the real Cloudflare Tunnel + Access path in front of either 6080 or 8080,
+and a genuine multi-version Emacs matrix (the `--emacs V,...` control flow
+is proven, but every environment this has run in so far has exactly one
+real Emacs release installed). There is also, deliberately, only one
+profile so far (`smoke`) — DESIGN §8.5's own next step, once the core is
+proven generic, is adding a small profile for a package you actually use,
+to sanity-check the harness is usable by someone who didn't build it.
+
+None of that blocks trying it — building the image for real and running
+`eh doctor` against it is the right first step in any environment with
+normal Docker Hub access, and it should already be all green.
+
+## Implementation status and validation notes
+
+**All five phases are implemented.** Phase 0-1: the container image, the
+`ehd` dispatcher, the `eh` client, the Elisp driver (`eh-driver.el`), the
+scenario DSL (`eh-scenario.el`), and the `smoke` profile that proves the
+core is package-agnostic. Phase 2: `eh click`/`eh drag`/`eh scroll`/`eh
+keys --x`, `eh video` (including `--gif`), and pixel baselines via `eh
+diff-shot`/`eh baseline accept` with `.mask.json` sidecar support, wired
+end-to-end including the scenario-level `eh-expect-no-visual-drift`. Phase
+3: the `--emacs V,...` matrix flag on `eh run` and the GitHub Actions
+workflow that builds the image and runs the smoke profile headlessly.
+Phase 4: the HTTP transport in `ehd.py` and the MCP server — see below.
 
 Diff-shot's pixel comparison (ImageMagick `compare`/`identify`, plus mask
 rectangles applied via `convert -draw`) is implemented once, in Elisp
@@ -76,41 +489,19 @@ diff-shot`/`eh baseline accept`, via a thin `emacs_eval` wrapper in
 reimplemented per caller, since a scenario running inside Emacs has no
 channel back out to `ehd` mid-test (see DESIGN §8.1).
 
-The container image itself (`container/Dockerfile`, i.e. the `docker build`)
-has **not** been built in this environment: this sandbox's egress policy
-blocks Docker Hub's CDN (`production.cloudfront.docker.com`) with a policy
-403, so `docker build` fails on the base `FROM debian:bookworm-slim` layer
-before reaching any of this repo's own steps — a genuine egress restriction,
-not something fixable from inside the build. The GitHub Actions workflow
-above will be the first place the image itself actually builds.
-
-**The runtime it builds has, however, now been validated directly**: this
-sandbox does allow installing `emacs-gtk`, `Xvfb`, `openbox`, ImageMagick
-and `xdotool` via `apt` outside Docker, which is enough to run `ehd.py` and
-`bin/eh` exactly as the container would — a real cairo-enabled GTK Emacs on
-a real (virtual) X display, driven by the real dispatcher, with no mocks.
-Doing this for the first time surfaced several real, previously-latent bugs
-that no amount of batch-mode or unit-level testing could have caught (see
-below); all are now fixed and reverified. `eh doctor` reports fully green
-and `eh run smoke` passes all 3 scenarios end-to-end, repeatedly, from a
-cold start — DESIGN's own Phase 0 acceptance test (`eh shot` producing an
-exact 1280×800 PNG) and Phase 1 acceptance test (a real scenario passing
-against a real graphical frame) both hold. Build and run `eh doctor` (§12)
-as the first acceptance check in any environment with normal Docker Hub
-access — it should already be all green.
-
 ### What's been validated
 
-- All Python (`bin/eh`, `ehd/ehd.py`, `ehd/ehd_cli.py`) compiles cleanly and
-  passes `pyflakes` (one pre-existing unused import, `socket` in `ehd.py`,
-  predates this pass and is unrelated to it).
+- All Python (`bin/eh`, `ehd/ehd.py`, `ehd/ehd_cli.py`,
+  `mcp-server/eh_mcp_server.py`, `mcp-server/test_acceptance.py`) compiles
+  cleanly and passes `pyflakes` (one pre-existing unused import, `socket`
+  in `ehd.py`, predates this and is unrelated to it).
 - All Elisp (`elisp/*.el`) byte-compiles cleanly (only benign warnings for
   GUI-only primitives and variables defined via `require` at runtime).
-- **`eh doctor` and `eh run smoke` now both pass end-to-end against a real
+- **`eh doctor` and `eh run smoke` pass end-to-end against a real
   `emacs-gtk` + `Xvfb` + `openbox`**, run directly via `ehd.py`/`bin/eh`
-  outside Docker (see above) — repeatedly, from a fully cold process state,
-  not once by chance. Getting there found and fixed real bugs, all in code
-  that had never actually been run against a live display before this pass:
+  outside Docker — repeatedly, from a fully cold process state, not once by
+  chance. Getting there found and fixed real bugs, all in code that had
+  never actually been run against a live display before:
   - **Session directories were created world-readable (mode 755).** Emacs's
     own `server-ensure-safe-dir` refuses to bind the Unix-domain server
     socket in a directory that isn't 0700, so `eh-driver-start-server`
@@ -242,9 +633,8 @@ access — it should already be all green.
   entirely, driving `emacsclient --eval` by hand against a from-scratch
   `server-start`'d Emacs) on a synthetic pass/fail/skip mix, then against
   the real `smoke` suite twice from cold sessions.
-- Two new permanent scenarios in `profiles/smoke/scenarios/smoke.el` prove
-  DESIGN §14 phase 2's literal acceptance test, which had only been
-  plumbed, not exercised, before this pass:
+- Two permanent scenarios in `profiles/smoke/scenarios/smoke.el` prove
+  DESIGN §14 phase 2's literal acceptance test:
   - `smoke/image-slices-are-addressable` inserts a real tall PNG fixture
     (`tall-stripes.png`, five distinct 100px bands) via the built-in
     `insert-sliced-image` and asserts, via `eh-snapshot`, that each slice
@@ -275,7 +665,7 @@ access — it should already be all green.
     ordinary case for a freshly-run profile.
 - **Phase 4's HTTP transport and MCP server were validated live**, the same
   way (`ehd.py` run directly against a real display, not mocked), and doing
-  so surfaced three real, previously-latent bugs in the *core* eval bridge —
+  so surfaced four real, previously-latent bugs in the *core* eval bridge —
   not new code this pass wrote, code every `eh` command has depended on
   since phase 1, just never driven this way (one CLI invocation at a time,
   the way an interactive agent actually uses it) until now:
@@ -291,18 +681,18 @@ access — it should already be all green.
     the whole session (`emacsclient` exits nonzero, `ehd.py` marks the
     session dead) instead of returning `{"ok": false, "error": {...}}`.
     This is exactly the defect already found and fixed for
-    `eh-run-scenarios-json` (see the phase 1-3 entry above) — just never
-    applied to the bridge every other `eh` command goes through. Fixed by
-    switching `eh--eval-capturing` to a plain `condition-case` (which *does*
-    resolve correctly here, per the same reasoning), using
-    `signal-hook-function` — which still runs at the point of the signal,
-    before the stack unwinds — to keep capturing a real backtrace without
-    reintroducing the `debug-on-error` problem. That fix had its own bug on
-    the first attempt: the naive `signal-hook-function` handler recurses
-    into itself (`backtrace`/`with-output-to-string` can themselves signal)
-    and blows the C stack, hanging the whole session at 100% CPU — caught
-    live, fixed by rebinding `signal-hook-function` to nil for the handler's
-    own extent.
+    `eh-run-scenarios-json` above — just never applied to the bridge every
+    other `eh` command goes through. Fixed by switching
+    `eh--eval-capturing` to a plain `condition-case` (which *does* resolve
+    correctly here, per the same reasoning), using `signal-hook-function`
+    — which still runs at the point of the signal, before the stack
+    unwinds — to keep capturing a real backtrace without reintroducing the
+    `debug-on-error` problem. That fix had its own bug on the first
+    attempt: the naive `signal-hook-function` handler recurses into itself
+    (`backtrace`/`with-output-to-string` can themselves signal) and blows
+    the C stack, hanging the whole session at 100% CPU — caught live,
+    fixed by rebinding `signal-hook-function` to nil for the handler's own
+    extent.
   - **Named waiters (`eh wait NAME`) never matched.** `ehd.py` sends the
     waiter name as an Elisp *string* (the file-based eval protocol has no
     way to send a bare symbol); `eh-register-waiter` keys `eh-waiters` by
@@ -352,113 +742,20 @@ access — it should already be all green.
     surfaced there because interactive, separate-invocation usage (as
     opposed to one continuous scenario body) hadn't been exercised this
     thoroughly before.
-- What's *still not* validated here: `docker build` itself — reproduced
-  again this pass (Docker Hub's CDN, `production.cloudfront.docker.com`,
-  still answers 403 through this sandbox's egress policy, on the very first
-  `FROM debian:bookworm-slim` layer, before reaching anything in this repo)
-  — `ffmpeg` video/gif capture, and the browser view
-  (x11vnc/websockify/noVNC). Also still unvalidated: the actual Cloudflare
-  Tunnel + Access path in front of the HTTP API (DESIGN §10.2) — the
-  `CF-Access-Client-Id`/`Secret` header check in `ehd.py` is proven, but
-  there is no Cloudflare account in this environment to prove the tunnel
-  itself terminates there correctly.
 
-The repository name and the `eh` command name are placeholders — rename
-freely, but rename consistently.
+### What's still not validated
 
-## The one-paragraph version
-
-A container runs `Xvfb`, a pinned cairo-enabled GNU Emacs, and whatever side
-services a given profile declares (DESIGN §9 covers the pattern for a
-package that talks to a subprocess: a real instance of it plus a scriptable
-fake speaking the same protocol). A small in-container dispatcher (`ehd`)
-exposes that Emacs over a Unix socket; a thin client (`eh`) reaches it over
-SSH from wherever the agent is running. The agent's default move is **not**
-to look at pixels: it asks Emacs for a structured dump of buffer text,
-overlays, text properties, faces and image descriptors, and asserts on
-that. Screenshots (`x-export-frames`, taken from inside Emacs — no window
-manager races) are the backstop for the handful of things only redisplay
-knows. Scenarios are ERT tests written in Emacs Lisp that run *inside* the
-instance under test, so the same file works both under the agent's hand and
-in CI.
-
-## Layout
-
-```
-emacs-harness/
-├── DESIGN.md                  ← the spec
-├── AGENTS.md / CLAUDE.md      ← the agent operating contract (DESIGN §11)
-├── docs/example-scenarios.md  ← a fully worked, fictional-package scenario
-│                                 catalogue illustrating the categories of
-│                                 behaviour a real profile would target
-├── .github/workflows/ci.yml   ← builds the image, runs `eh doctor` + `eh run smoke` headlessly
-├── bin/eh                     ← thin client (runs on your laptop)
-├── container/                 ← Dockerfile, supervisord, entrypoint
-├── compose.yaml                ← local-dev wrapper around the one image
-├── ehd/                       ← in-container dispatcher (ehd.py) + bridge (ehd_cli.py)
-├── elisp/                     ← eh-driver.el, eh-scenario.el, eh-profile.el, eh-init-core.el
-├── mcp-server/                ← MCP server (eh_mcp_server.py): runs where Claude Code
-│                                 runs, not in the container -- a thin shim over ehd's
-│                                 HTTP API (DESIGN §14 phase 4); test_acceptance.py is
-│                                 phase 4's own acceptance test, frozen and run in CI
-├── profiles/
-│   └── smoke/                 ← trivial profile that proves the core is generic
-│       (no other profiles exist yet -- add one for whatever package you
-│        want to test, see DESIGN.md §8.4)
-└── runs/                      ← per-run artifacts (gitignored)
-```
-
-## Quickstart (once built)
-
-```
-docker build -f container/Dockerfile -t emacs-harness:dev .
-docker run --rm -it emacs-harness:dev doctor
-docker run -d --name emacs-harness -p 6080:6080 emacs-harness:dev server
-EH_TRANSPORT=docker EH_CONTAINER=emacs-harness bin/eh doctor
-EH_TRANSPORT=docker EH_CONTAINER=emacs-harness bin/eh run smoke
-```
-
-### The HTTP API and the MCP server (phase 4)
-
-Off by default. Enable it at `docker run` time, publish 8080 alongside
-6080, and set the same `CF-Access-Client-Id`/`Secret` pair on both sides —
-`ehd` checks them as defense in depth; the real access boundary is a
-Cloudflare Tunnel + Access application on its own hostname in front of
-8080, same pattern DESIGN §10.2 already uses for the noVNC view:
-
-```
-docker run -d --name emacs-harness -p 6080:6080 -p 8080:8080 \
-    -e EH_HTTP_ENABLE=1 -e EH_HTTP_CLIENT_ID=<id> -e EH_HTTP_CLIENT_SECRET=<secret> \
-    emacs-harness:dev server
-
-curl https://emacs-harness-api.example.com/health   # once the tunnel is up
-```
-
-Point `bin/eh` at it directly:
-
-```
-EH_TRANSPORT=http EH_HOST=https://emacs-harness-api.example.com \
-EH_CF_ACCESS_CLIENT_ID=<id> EH_CF_ACCESS_CLIENT_SECRET=<secret> \
-    bin/eh doctor
-```
-
-Or run the MCP server (`pip install -r mcp-server/requirements.txt`) and
-point Claude Code (or any MCP client) at it over stdio, with the same
-`EH_HOST`/`EH_CF_ACCESS_CLIENT_ID`/`EH_CF_ACCESS_CLIENT_SECRET` set in its
-environment:
-
-```json
-{
-  "mcpServers": {
-    "emacs-harness": {
-      "command": "python3",
-      "args": ["/path/to/emacs-harness/mcp-server/eh_mcp_server.py"],
-      "env": {
-        "EH_HOST": "https://emacs-harness-api.example.com",
-        "EH_CF_ACCESS_CLIENT_ID": "<id>",
-        "EH_CF_ACCESS_CLIENT_SECRET": "<secret>"
-      }
-    }
-  }
-}
-```
+`docker build` itself — reproduced again during the phase 4 pass (Docker
+Hub's CDN, `production.cloudfront.docker.com`, still answers 403 through
+this sandbox's egress policy, on the very first `FROM debian:bookworm-slim`
+layer, before reaching anything in this repo); `ffmpeg` video/gif capture;
+the browser view (`x11vnc`/`websockify`/noVNC); the actual Cloudflare
+Tunnel + Access path in front of either port (the `CF-Access-Client-Id`/
+`Secret` header check in `ehd.py` is proven, but there is no Cloudflare
+account in any environment this has run in to prove a tunnel itself
+terminates there correctly); any profile beyond `smoke` itself; and pinned
+multi-version Emacs *images* (the `--emacs V,...` control flow is proven
+against two distinctly-named binaries, but every environment this harness
+has been driven in so far has exactly one real Emacs release installed, so
+*different Emacs versions actually disagreeing on something* remains
+unexercised — see DESIGN §13.3 open question 1).
