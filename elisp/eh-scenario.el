@@ -36,6 +36,10 @@ single most common source of \"passes alone, fails in the suite\"
 (DESIGN 5.2), and it is invisible: the leak shows up as an unrelated
 scenario failing for a reason that makes no sense where it is.")
 
+(defvar eh-profile-log-buffers nil
+  "Buffer names a profile declared worth sweeping into a failure bundle.
+Set by `eh-defprofile'; declared here too so this file compiles alone.")
+
 (defvar eh-current-scenario-name nil)
 (defvar eh-artifacts-root nil
   "Run directory root; each scenario gets ARTIFACTS-ROOT/<scenario-name>/.")
@@ -221,6 +225,19 @@ the signal that caused the abnormal exit."
                                       (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" name))
                               dir)
               (insert (eh--prin1-to-string-unlimited snapshot)))))))
+    ;; A profile's declared log buffers, by name.  The sweep above skips
+    ;; every buffer whose name starts with a space, which is exactly
+    ;; where a package hides a subprocess's stderr -- and that is usually
+    ;; the one place a failure's actual reason is written down.  Nothing
+    ;; used `:log-buffers' before this, so declaring them did nothing.
+    (dolist (name eh-profile-log-buffers)
+      (let ((buffer (get-buffer name)))
+        (when (buffer-live-p buffer)
+          (with-temp-file (expand-file-name
+                            (format "log-%s.txt"
+                                    (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" name))
+                            dir)
+            (insert-buffer-substring buffer)))))
     (when (display-graphic-p)
       (ignore-errors (eh-shot-to-file (expand-file-name "failure.png" dir))))))
 
