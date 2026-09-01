@@ -34,6 +34,13 @@ them rather than hardcoding paths:
 | `eh-profile-bridge-scripts-dir` | `<profile>/bridge-scripts/` |
 | `eh-profile-scratch-dir` | a writable scratch dir, per session |
 
+A profile that changes its own globals from a scenario — pointing the
+package at a different backend, say — should reset them from
+`eh-scenario-setup-functions`, which runs before every scenario body.
+Those globals are not buffers, so the automatic teardown does not touch
+them, and the leak surfaces as an unrelated scenario failing for a
+reason that makes no sense where it is.
+
 `init.el` must `(load (expand-file-name "profile.el" eh-profile-dir))`
 itself. Skipping that line is a silent trap: every session still starts
 with no error, but the manifest's waiters and snapshot properties simply

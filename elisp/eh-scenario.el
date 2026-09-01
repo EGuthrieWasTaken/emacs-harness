@@ -24,6 +24,18 @@ Never write into the read-only package/profile source trees (DESIGN §5.3).")
   "List of kernel name strings (e.g. \"python3\") reachable this session.
 Used by `:needs (:kernel ...)' to decide skip vs run.")
 
+(defvar eh-scenario-setup-functions nil
+  "Functions run with no arguments before every scenario body.
+
+The place a profile puts \"put my package back the way a fresh session
+found it\".  A profile's own globals -- which backend a package is
+pointed at, a mode a scenario turned on -- are not buffers, so the
+buffer teardown below does not touch them, and a scenario that changed
+one silently changes every scenario that runs after it.  That is the
+single most common source of \"passes alone, fails in the suite\"
+(DESIGN 5.2), and it is invisible: the leak shows up as an unrelated
+scenario failing for a reason that makes no sense where it is.")
+
 (defvar eh-current-scenario-name nil)
 (defvar eh-artifacts-root nil
   "Run directory root; each scenario gets ARTIFACTS-ROOT/<scenario-name>/.")
@@ -156,6 +168,7 @@ the thing on the other end of the pipe is a fixture."
            ;; only gets set on normal completion.
            (unwind-protect
                (progn
+                 (run-hooks 'eh-scenario-setup-functions)
                  ,(when geometry
                     `(eh-apply-determinism-settings ,(car geometry) ,(cdr geometry)))
                  ,(when fixture `(eh-open-fixture ,fixture))
