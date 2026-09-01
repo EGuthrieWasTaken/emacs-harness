@@ -4,6 +4,15 @@
 ;; own determinism block (DESIGN.md §7.1, §8.4).  No external package,
 ;; no kernel, no bridge -- proof that the harness core is package-agnostic.
 
+;; `profile.el' (the declarative manifest: snapshot props, named waiters,
+;; log buffers) is loaded from here, not by the harness core -- see
+;; eh-profile.el's own header comment. Skipping this line is a silent
+;; trap: every session still starts fine with no error, but
+;; `eh-defprofile's :waiters/:snapshot-props/:log-buffers simply never
+;; register, so e.g. `eh wait smoke-ready' fails with "no such waiter"
+;; forever (found while validating the phase 4 HTTP/MCP work).
+(load (expand-file-name "profile.el" eh-profile-dir))
+
 (defface smoke-marker-face
   '((t :foreground "red" :weight bold))
   "Face applied to the marker text by `smoke-highlight-marker'.")

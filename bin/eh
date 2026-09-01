@@ -8,10 +8,17 @@ caller can branch on without parsing prose.
   0 success    1 assertion/scenario failure    2 usage error
   3 timeout    4 Emacs signalled an error       5 session unreachable/dead
 
-Transport is chosen by $EH_TRANSPORT (local|docker|ssh), default "docker"
-outside a container / "local" when EH_SOCK is reachable directly. See
-~/.config/eh/config (INI-style: [eh] transport=..., host=..., container=...)
-for a persistent default.
+Transport is chosen by $EH_TRANSPORT (local|docker|ssh|http), default
+"docker" outside a container / "local" when EH_SOCK is reachable directly.
+See ~/.config/eh/config (INI-style: [eh] transport=..., host=...,
+container=...) for a persistent default.
+
+`http` (DESIGN §6.1, added in phase 4 for the MCP server -- see
+mcp-server/) POSTs to `$EH_HOST/v1/<cmd>`, e.g. EH_HOST=https://emacs-
+harness.example.com. Cloudflare Access service-token credentials, if the
+harness's Access application is configured to require them, come from
+$EH_CF_ACCESS_CLIENT_ID / $EH_CF_ACCESS_CLIENT_SECRET (or
+cf_access_client_id / cf_access_client_secret in the config file).
 """
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ import os
 import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 EXIT_USAGE = 2
@@ -47,9 +56,50 @@ def transport_settings():
     return transport, host, container, sock
 
 
+def _http_credentials(cfg: dict) -> tuple[str, str]:
+    client_id = os.environ.get("EH_CF_ACCESS_CLIENT_ID", cfg.get("cf_access_client_id", ""))
+    client_secret = os.environ.get("EH_CF_ACCESS_CLIENT_SECRET", cfg.get("cf_access_client_secret", ""))
+    return client_id, client_secret
+
+
+def send_http_request(req: dict, host: str, timeout: float) -> dict:
+    if not host:
+        return {"ok": False,
+                "error": {"message": "EH_TRANSPORT=http requires EH_HOST "
+                                      "(the harness's https:// base URL)"},
+                "exit_code": EXIT_USAGE}
+    body = json.dumps({"session": req.get("session"), "args": req.get("args") or {},
+                        "timeout": req.get("timeout")}).encode()
+    url = f"{host.rstrip('/')}/v1/{req['cmd']}"
+    headers = {"Content-Type": "application/json"}
+    client_id, client_secret = _http_credentials(load_config())
+    if client_id:
+        headers["CF-Access-Client-Id"] = client_id
+    if client_secret:
+        headers["CF-Access-Client-Secret"] = client_secret
+    http_req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(http_req, timeout=timeout + 10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"ok": False, "error": {"message": f"http {e.code}: {e.reason}"},
+                    "exit_code": 5}
+    except urllib.error.URLError as e:
+        return {"ok": False, "error": {"message": f"cannot reach ehd (http, {url}): {e.reason}"},
+                "exit_code": 5}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": {"message": f"http transport error: {e}"}, "exit_code": 5}
+
+
 def send_request(req: dict, timeout: float) -> dict:
     transport, host, container, sock_path = transport_settings()
     line = (json.dumps(req) + "\n").encode()
+
+    if transport == "http":
+        return send_http_request(req, host, timeout)
 
     if transport == "local":
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
