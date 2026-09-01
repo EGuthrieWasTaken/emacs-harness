@@ -775,3 +775,7 @@ against two distinctly-named binaries, but every environment this harness
 has been driven in so far has exactly one real Emacs release installed, so
 *different Emacs versions actually disagreeing on something* remains
 unexercised — see DESIGN §13.3 open question 1).
+
+## License
+
+GNU General Public License v3.0 or later. See [`LICENSE`](LICENSE).
