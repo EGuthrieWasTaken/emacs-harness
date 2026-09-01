@@ -31,6 +31,21 @@ without touching undo or the modified flag\")."
   (insert-image (create-image (expand-file-name "tiny.png" eh-profile-fixtures-dir) 'png nil)
                 "smoke-image"))
 
+(defconst smoke-sliced-image-rows 5
+  "Number of rows `smoke-insert-sliced-image' slices its fixture into.")
+
+(defun smoke-insert-sliced-image ()
+  "Insert the tall five-band PNG fixture, sliced into
+`smoke-sliced-image-rows' rows via the built-in `insert-sliced-image' --
+no external package needed to exercise real image slicing (DESIGN.md §1,
+§14 phase 2's \"click the third slice\" acceptance test)."
+  (interactive)
+  (goto-char (point-max))
+  (insert-sliced-image
+   (create-image (expand-file-name "tall-stripes.png" eh-profile-fixtures-dir) 'png nil)
+   "smoke-sliced-image" nil smoke-sliced-image-rows))
+
 (global-set-key (kbd "C-c C-s") #'smoke-highlight-marker)
 (global-set-key (kbd "C-c C-i") #'smoke-insert-fixture-image)
+(global-set-key (kbd "C-c C-l") #'smoke-insert-sliced-image)
 (add-to-list 'auto-mode-alist '("\\.txt\\'" . text-mode))

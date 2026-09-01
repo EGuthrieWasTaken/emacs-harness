@@ -334,30 +334,56 @@ evaluates it, writes out/REQ-ID.json.  Returns REQ-ID."
    ((or (symbolp v) (numberp v)) (format "%s" v))
    (t (eh--prin1-to-string-unlimited v))))
 
+(defun eh--image-bytes (image-spec)
+  (let ((data (plist-get (cdr image-spec) :data))
+        (file (plist-get (cdr image-spec) :file)))
+    (cond (data data)
+          (file (ignore-errors
+                  (with-temp-buffer
+                    (insert-file-contents-literally file)
+                    (buffer-string))))
+          (t nil))))
+
+(defun eh--image-descriptor (image-spec &optional wrapper-slice)
+  "IMAGE-SPEC is a full (image :type ...) list.  WRAPPER-SLICE, if
+given, is the (X Y WIDTH HEIGHT) list from the `insert-sliced-image'
+wrapper form `((slice X Y WIDTH HEIGHT) IMAGE-SPEC)' -- distinct from,
+but reported the same way as, an image spec's own :slice plist key
+\(both are valid Emacs display-property shapes for a sliced image; see
+the Elisp manual, \"Image Descriptors\")."
+  (let* ((full-size (ignore-errors (image-size image-spec t)))
+         (bytes (eh--image-bytes image-spec))
+         (slice (or wrapper-slice (plist-get (cdr image-spec) :slice))))
+    `((kind . "image")
+      (type . ,(format "%s" (plist-get (cdr image-spec) :type)))
+      (width_px . ,(if full-size (car full-size) :json-false))
+      (height_px . ,(if full-size (cdr full-size) :json-false))
+      (scale . ,(or (plist-get (cdr image-spec) :scale) 1.0))
+      (slice . ,(if slice
+                    (if full-size
+                        (let ((sx (nth 0 slice)) (sy (nth 1 slice))
+                              (sw (nth 2 slice)) (sh (nth 3 slice))
+                              (fw (car full-size)) (fh (cdr full-size)))
+                          `((x . ,sx) (y . ,sy) (width . ,sw) (height . ,sh)
+                            (x_px . ,(round (* sx fw))) (y_px . ,(round (* sy fh)))
+                            (width_px . ,(round (* sw fw))) (height_px . ,(round (* sh fh)))))
+                      (format "%s" slice))
+                  :json-false))
+      (sha256 . ,(if bytes (secure-hash 'sha256 bytes) :json-false))
+      (bytes . ,(if bytes (length bytes) 0)))))
+
 (defun eh--display-descriptor (pos)
   (let ((disp (get-char-property pos 'display)))
     (cond
      ((null disp) nil)
      ((and (consp disp) (eq (car disp) 'image))
-      (let* ((size (ignore-errors (image-size disp t)))
-             (data (plist-get (cdr disp) :data))
-             (file (plist-get (cdr disp) :file))
-             (bytes (cond (data data)
-                          (file (ignore-errors
-                                  (with-temp-buffer
-                                    (insert-file-contents-literally file)
-                                    (buffer-string))))
-                          (t nil))))
-        `((kind . "image")
-          (type . ,(format "%s" (plist-get (cdr disp) :type)))
-          (width_px . ,(if size (car size) :json-false))
-          (height_px . ,(if size (cdr size) :json-false))
-          (scale . ,(or (plist-get (cdr disp) :scale) 1.0))
-          (slice . ,(if (plist-get (cdr disp) :slice)
-                        (format "%s" (plist-get (cdr disp) :slice))
-                      :json-false))
-          (sha256 . ,(if bytes (secure-hash 'sha256 bytes) :json-false))
-          (bytes . ,(if bytes (length bytes) 0)))))
+      (eh--image-descriptor disp))
+     ;; `insert-sliced-image' produces `((slice X Y W H) (image ...))',
+     ;; not an image spec with a :slice plist key -- a second, equally
+     ;; valid Emacs display-property shape for the same concept.
+     ((and (consp disp) (consp (car disp)) (eq (caar disp) 'slice)
+           (consp (cadr disp)) (eq (car (cadr disp)) 'image))
+      (eh--image-descriptor (cadr disp) (cdr (car disp))))
      ((stringp disp) `((kind . "rule") (text . ,disp)))
      (t `((kind . "other") (repr . ,(eh--prin1-to-string-unlimited disp)))))))
 
@@ -667,7 +693,11 @@ NAME under the session's Emacs version/geometry/theme (§6.4, §8.3).
 MASK, given, overrides the baseline's own NAME.mask.json sidecar; each
 entry is a (X Y W H) rectangle.  Returns a plist:
 \(:ok BOOL :changed-pixels N :total-pixels N :ratio F
- :actual PATH :diff PATH-OR-NIL :baseline PATH :error STRING-OR-NIL\)."
+ :actual PATH :diff PATH-OR-NIL :baseline PATH :error STRING-OR-NIL
+ :no-baseline BOOL\).  :no-baseline distinguishes \"nothing to compare
+against yet\" (a scenario using this should skip, not fail: a baseline
+is per Emacs-version/geometry/theme, and one profile is routinely run
+across several of each) from a real pixel mismatch."
   (let* ((tolerance (or tolerance 0.002))
          (out-dir (or out-dir eh-run-dir))
          (actual (expand-file-name (format "%s.actual.png" name) out-dir))
@@ -676,7 +706,7 @@ entry is a (X Y W H) rectangle.  Returns a plist:
     (eh-shot-to-file actual)
     (if (not (file-exists-p baseline))
         (list :ok nil :changed-pixels nil :total-pixels nil :ratio nil
-              :actual actual :diff nil :baseline baseline
+              :actual actual :diff nil :baseline baseline :no-baseline t
               :error (format "no baseline for %s at %s -- run `eh baseline accept %s'"
                               name baseline name))
       (condition-case err
@@ -710,6 +740,7 @@ entry is a (X Y W H) rectangle.  Returns a plist:
         (actual . ,(plist-get r :actual))
         (diff . ,(or (plist-get r :diff) :json-false))
         (baseline . ,(plist-get r :baseline))
+        (no_baseline . ,(if (plist-get r :no-baseline) t :json-false))
         (error . ,(or (plist-get r :error) :json-false)))))))
 
 (cl-defun eh-baseline-accept (name &key all out-dir)

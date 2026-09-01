@@ -171,7 +171,17 @@ class SessionManager:
                          EH_SOCKET_NAME=socket_name)
         sess_env.pop("COLORTERM", None)
         emacs_log = open(run_dir / "emacs.log", "wb")
-        emacs = subprocess.Popen(emacs_args, env=sess_env, stdout=emacs_log, stderr=emacs_log)
+        try:
+            emacs = subprocess.Popen(emacs_args, env=sess_env, stdout=emacs_log, stderr=emacs_log)
+        except OSError as e:
+            # Most commonly a bad --emacs binary (matrix runs pass one per
+            # version -- DESIGN §14 phase 3).  Must surface as EhError, not
+            # escape as a raw OSError: `_run_one_version` only catches
+            # EhError to convert a bad version into that version's own
+            # failed result rather than aborting the whole matrix.
+            xvfb.kill()
+            openbox.kill()
+            raise EhError(f"failed to launch {emacs_bin}: {e}", EXIT_SESSION_DEAD)
 
         sess = Session(name=name, display=display, geometry=geometry, theme=theme,
                         profile=profile, emacs_bin=emacs_bin, scratch_home=scratch_home,
