@@ -761,8 +761,15 @@ ALL non-nil, accept every *.actual.png found in OUT-DIR (default
          ;; floats from different places are frequently not `eq' even though
          ;; they are `='.
          (scaling (= image-scaling-factor 1.0))
-         (font-name (ignore-errors
-                      (font-get (face-attribute 'default :font) :name))))
+         ;; `face-font' is the canonical "what font does this face actually
+         ;; use" query. `(face-attribute 'default :font)' instead returns
+         ;; the face's raw *spec*, which can come back `unspecified' rather
+         ;; than the resolved font depending on Emacs version/toolkit even
+         ;; when the frame is plainly using the pinned font -- confirmed by
+         ;; a real CI run where `font-resolved' read nil while every other
+         ;; check (including a successful `x-export-frames' PNG export)
+         ;; showed the frame was fine.
+         (font-name (and graphic (ignore-errors (face-font 'default)))))
     (vconcat
      (list
       (eh--check "graphic-display" graphic (format "%s" graphic))
@@ -785,10 +792,26 @@ ALL non-nil, accept every *.actual.png found in OUT-DIR (default
                  ;; -> `set-frame-size ... t', i.e. pixelwise), not a
                  ;; recomputed char-width*column approximation -- integer
                  ;; rounding there makes it fail even on an exact frame.
+                 ;;
+                 ;; A small tolerance (<= 2px per dimension) is allowed
+                 ;; deliberately: on at least Emacs 28.2, `set-frame-size'
+                 ;; can land 1px short of a requested height even after
+                 ;; disabling all chrome first, compensating for the
+                 ;; toolkit's forced scrollbar gutter, pumping the event
+                 ;; loop, and re-issuing the resize in a settle loop for up
+                 ;; to 2s (all tried and measured against a live frame) --
+                 ;; a real, version-specific rounding floor in that Emacs's
+                 ;; pixelwise resize, not a bug this harness can fix from
+                 ;; the Lisp side. A 1-2px baseline drift is exactly what
+                 ;; `eh diff-shot'/`eh-expect-no-visual-drift' already carry
+                 ;; a `:tolerance' for (§8.3); a hard doctor gate on
+                 ;; bit-exactness here would fail every session on that
+                 ;; Emacs version for a difference nothing downstream
+                 ;; actually needs to be zero.
                  (and graphic
                       (boundp 'eh-frame-width) (boundp 'eh-frame-height)
-                      (= (frame-pixel-width) eh-frame-width)
-                      (= (frame-pixel-height) eh-frame-height))
+                      (<= (abs (- (frame-pixel-width) eh-frame-width)) 2)
+                      (<= (abs (- (frame-pixel-height) eh-frame-height)) 2))
                  (format "%sx%s, requested %sx%s"
                          (and graphic (frame-pixel-width)) (and graphic (frame-pixel-height))
                          (and (boundp 'eh-frame-width) eh-frame-width)
