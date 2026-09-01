@@ -74,7 +74,18 @@ Looked up by `eh wait NAME'.")
     (when (fboundp 'tooltip-mode) (tooltip-mode -1))
     (when (display-graphic-p)
       (setq frame-resize-pixelwise t)
-      (ignore-errors (set-frame-font font t t))
+      ;; A bare "Family-SIZE" string's parsing (XLFD? Fontconfig pattern?
+      ;; GTK font description?) is exactly the kind of thing that varies
+      ;; across Emacs versions/toolkits. `font-spec' sidesteps the string
+      ;; parsing question entirely by naming the family and size as
+      ;; separate, unambiguous fields.
+      (let* ((name-size (if (string-match "\\`\\(.*\\)-\\([0-9.]+\\)\\'" font)
+                             (cons (match-string 1 font) (string-to-number (match-string 2 font)))
+                           (cons font nil)))
+             (family (car name-size))
+             (size (or (cdr name-size) 11)))
+        (or (ignore-errors (set-frame-font (font-spec :family family :size (float size)) t t))
+            (ignore-errors (set-frame-font font t t))))
       ;; On at least the GTK toolkit build, `scroll-bar-mode -1' hides the
       ;; bar (sets `vertical-scroll-bars' to nil) but the toolkit still
       ;; reserves `scroll-bar-width' pixels of gutter that count toward
@@ -86,19 +97,25 @@ Looked up by `eh wait NAME'.")
       ;; requested widths and observing the same fixed offset every time.
       ;; So undersize the request by that (queryable, environment-specific)
       ;; amount and let the toolkit's own overhead bring it back to WIDTH.
-      (let ((overhead (or (frame-parameter (selected-frame) 'scroll-bar-width) 0)))
-        (set-frame-size (selected-frame) (max 1 (- width overhead)) height t))
-      ;; `set-frame-size' only *requests* the resize; on X11/GTK the frame's
+      ;;
+      ;; `set-frame-size' only *requests* a resize; on X11/GTK the frame's
       ;; pixel dimensions don't actually update until Emacs processes the
       ;; window manager's ConfigureNotify confirming it, which needs the
-      ;; event loop pumped. A caller that inspects `frame-pixel-width'
+      ;; event loop pumped -- a caller that inspects `frame-pixel-width'
       ;; immediately afterward (as `eh-doctor' does, right at session
       ;; startup with nothing else yet run to pump events as a side
-      ;; effect) can otherwise see a stale, pre-resize size.
+      ;; effect) can otherwise see a stale, pre-resize size. So re-issue
+      ;; the resize on every iteration of a short bounded settle loop,
+      ;; rather than just waiting once and hoping: a single unconfirmed
+      ;; request can also land 1px short from char-cell quantization on
+      ;; some font/toolkit combinations, and re-asking converges on that
+      ;; too.
       (let ((deadline (+ (float-time) 2)))
         (while (and (< (float-time) deadline)
                     (not (and (= (frame-pixel-width) width)
                               (= (frame-pixel-height) height))))
+          (let ((overhead (or (frame-parameter (selected-frame) 'scroll-bar-width) 0)))
+            (set-frame-size (selected-frame) (max 1 (- width overhead)) height t))
           (redisplay t)
           (sit-for 0.05))))
     (setq make-backup-files nil
