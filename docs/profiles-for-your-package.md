@@ -148,6 +148,10 @@ version — one JSON object per line (an object may span lines), `#` and
 ```
 
 - `~...~` is a regular expression; anything else must be equal.
+- `{"on_input": {...}}` instead of `{"on": {...}}` matches a line the
+  *client* sent that is not a request — the answer to an
+  `input_request`, correlated by id alone — so the reply side of a
+  prompt exchange is assertable too.
 - `{"$file": "PATH"}` anywhere in a payload is replaced by the file's
   contents — base64 if it isn't valid UTF-8, so a real PNG fixture goes
   in as a real base64 mimebundle.

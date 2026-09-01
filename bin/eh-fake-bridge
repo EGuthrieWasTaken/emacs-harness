@@ -81,6 +81,19 @@ object:
   `times'     how many times this rule may match before it is retired
               and later rules get a look in; default unlimited.
 
+A rule may match on `on_input' instead of `on'.  Those match a line the
+client sent that is *not* a request -- the answer to an
+`input_request', typically -- against the line's own top-level keys:
+
+    {"on_input": {"input": "~.~"},
+     "emit": [{"after_ms": 0, "output": {"type":"stream","text":"got it\n"}}]}
+
+Correlation is by id alone on such a line, so without this the fake
+could pose a question and never react to the answer, leaving the
+interesting half of that exchange untestable.  An `on_input' rule with
+no `reply' emits and stops, rather than inventing a reply line no real
+backend would send.
+
 **Injections** fire on a wall-clock schedule from bridge start,
 independent of any request -- the "something else killed the backend"
 case:
@@ -247,12 +260,12 @@ def load_scripts(paths):
             obj["__source__"] = "%s:%d" % (os.path.basename(path), start_line)
             if "inject" in obj:
                 injections.append(obj)
-            elif "on" in obj:
+            elif "on" in obj or "on_input" in obj:
                 obj.setdefault("__matched__", 0)
                 rules.append(obj)
             else:
                 raise ScriptError(
-                    "%s:%d: object has neither `on' (a rule) nor `inject'"
+                    "%s:%d: object has none of `on', `on_input' or `inject'"
                     % (path, start_line)
                 )
         if buffered:
@@ -286,6 +299,8 @@ class Bridge:
         method = request.get(self.args.method_key)
         params = request.get(self.args.params_key) or {}
         for rule in self.rules:
+            if "on" not in rule:
+                continue
             times = rule.get("times")
             if times is not None and rule["__matched__"] >= times:
                 continue
@@ -297,6 +312,27 @@ class Bridge:
                     ok = False
                     break
             if ok:
+                rule["__matched__"] += 1
+                return rule
+        return None
+
+    def match_inbound(self, line):
+        """Select an `on_input' rule for a non-request line the client sent.
+
+        A protocol that can ask its client a question -- a prompt, a
+        credential, a confirmation -- gets the answer back on stdin with
+        no method of its own, correlated only by id.  Without this the
+        fake could pose the question but never react to the answer, so
+        the interesting half of that exchange (does what the client
+        typed actually reach the backend?) would be untestable."""
+        for rule in self.rules:
+            if "on_input" not in rule:
+                continue
+            times = rule.get("times")
+            if times is not None and rule["__matched__"] >= times:
+                continue
+            if all(_value_matches(pattern, line.get(key))
+                   for key, pattern in rule["on_input"].items()):
                 rule["__matched__"] += 1
                 return rule
         return None
@@ -375,9 +411,10 @@ class Bridge:
             return {k: Bridge._expand_repeats(v, collected) for k, v in value.items()}
         return value
 
-    def handle(self, request):
+    def handle(self, request, rule="<match>"):
         request_id = request.get(self.args.id_key)
-        rule = self.match(request)
+        if rule == "<match>":
+            rule = self.match(request)
 
         if rule is None:
             self.out.log("?? no rule for %r" % (request,))
@@ -405,8 +442,16 @@ class Bridge:
             if timer is not None:
                 scheduled.append(timer)
 
-        if rule.get("never_reply"):
-            self.out.log("-- %s: never_reply" % rule["__source__"])
+        if rule.get("never_reply") or (
+            "on_input" in rule and "reply" not in rule and "error" not in rule
+        ):
+            # An `on_input' rule that only emits has already said
+            # everything it had to say: the client's answer completes no
+            # request of its own, and inventing a reply for it would put
+            # a line on the wire no real backend would send.
+            for timer in scheduled:
+                timer.join()
+            self.out.log("-- %s: emitted, no reply" % rule["__source__"])
             return
 
         # Join the emit timers rather than sleeping for the same span.
@@ -457,7 +502,14 @@ class Bridge:
             # A reply to an input_request we emitted is inbound traffic,
             # not a new request; it carries no method.
             if self.args.method_key not in request:
-                self.out.log("-- inbound non-request (input reply?) ignored")
+                rule = self.match_inbound(request)
+                if rule is None:
+                    self.out.log("-- inbound non-request, no on_input rule; ignored")
+                    continue
+                handler = threading.Thread(
+                    target=self.handle, args=(request, rule), daemon=True)
+                self._handlers.append(handler)
+                handler.start()
                 continue
             handler = threading.Thread(target=self.handle, args=(request,), daemon=True)
             self._handlers.append(handler)

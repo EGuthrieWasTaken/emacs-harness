@@ -218,3 +218,32 @@ passed because a sleep happened to be long enough would be worthless."
                       2)
                      "the stderr-noise fault produced no stderr at all"))
       (delete-process proc))))
+
+(eh-scenario smoke/fake-bridge-reacts-to-what-the-client-answers
+  :doc "A backend that asks its client a question gets the answer back on
+        stdin with no method of its own, correlated only by id.  An
+        `on_input' rule matches that line, so a scenario can assert on
+        what the client actually sent -- the half of the exchange that is
+        otherwise invisible."
+  :tags (smoke bridge)
+
+  (let ((proc (smoke-bridge-start)))
+    (unwind-protect
+        (progn
+          (smoke-bridge-send proc '(:id 11 :method "ask"))
+          (eh-expect (smoke-bridge-wait
+                      (lambda ()
+                        (seq-find (lambda (l) (plist-member l :input_request))
+                                  smoke-bridge--lines)))
+                     "the bridge never asked its question")
+          ;; Answer it the way a client would: same id, no method.
+          (smoke-bridge-send proc '(:id 11 :input "Dave"))
+          (eh-expect (smoke-bridge-wait
+                      (lambda ()
+                        (seq-find (lambda (l)
+                                    (equal (plist-get (plist-get l :event) :type) "heard"))
+                                  smoke-bridge--lines)))
+                     "the bridge did not react to the client's answer")
+          (eh-expect-equal (smoke-bridge-reply 11) nil
+                           "answering a prompt must not complete the request by itself"))
+      (delete-process proc))))
