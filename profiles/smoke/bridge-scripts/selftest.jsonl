@@ -1,0 +1,32 @@
+# eh-fake-bridge's own fixture (DESIGN 9.2), in a deliberately generic
+# protocol: the smoke profile exists to prove nothing package-specific
+# has leaked into the core, so its fake backend must not speak any real
+# package's dialect either.
+
+# A plain request/reply round trip.
+{"on": {"method": "ping"}, "reply": {"pong": true}}
+
+# Streamed output, then a reply that repeats every chunk -- the
+# reconciliation case a real backend forces on every client.
+{"on": {"method": "run", "code": "~^count~"},
+ "emit": [{"after_ms":  0, "output": {"chunk": "one"}},
+          {"after_ms": 40, "output": {"chunk": "two"}},
+          {"after_ms": 80, "output": {"chunk": "three"}}],
+ "reply": {"status": "ok", "chunks": "<repeat-all-emitted>"}}
+
+# Regex matching, and an error reply rather than a result.
+{"on": {"method": "run", "code": "~boom~"},
+ "error": {"message": "it went bang", "status": 500}}
+
+# A request that is accepted and never answered: the wedged-request
+# case, impossible to stage against a real backend on demand.
+{"on": {"method": "wedge"}, "never_reply": true}
+
+# A reply cut off mid-JSON, to prove the client's line parser survives
+# garbage rather than wedging or dying.
+{"on": {"method": "truncated"}, "fault": "truncate-json",
+ "reply": {"padding": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+
+# An unsolicited event on a wall clock, with no request to hang it off:
+# "something else killed the backend".
+{"at": "t+150", "inject": {"event": {"type": "gone"}}}

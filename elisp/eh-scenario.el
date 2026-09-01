@@ -11,6 +11,12 @@
 
 (defvar eh-profile-name nil)
 (defvar eh-profile-fixtures-dir nil)
+(defvar eh-profile-bridge-scripts-dir nil
+  "Directory holding this profile's `eh-fake-bridge' scripts (DESIGN 9.2).
+A profile whose package talks to a backend process points that package's
+own \"how do I launch my backend\" option at `eh-fake-bridge-command',
+which resolves a script name against this directory.")
+
 (defvar eh-profile-scratch-dir nil
   "Session scratch HOME; fixtures are copied here before a scenario touches them.
 Never write into the read-only package/profile source trees (DESIGN §5.3).")
@@ -75,6 +81,38 @@ and find-file it there.  Never opens the read-only profile copy."
     (make-directory (file-name-directory dst) t)
     (copy-file src dst t)
     (find-file dst)))
+
+;;; ---------------------------------------------------------------------
+;;; the scriptable fake backend (DESIGN 9.2)
+
+(defvar eh-fake-bridge "/opt/eh/bin/eh-fake-bridge"
+  "Path to the scriptable stand-in for a package's backend process.")
+
+(defun eh-fake-bridge-command (&rest args)
+  "Command list running `eh-fake-bridge' with ARGS.
+A string ending in `.jsonl' names a script in the profile's
+`bridge-scripts/' directory and expands to `--script <abspath>';
+everything else is passed through untouched, so faults and key overrides
+read as themselves:
+
+  (eh-fake-bridge-command \"base.jsonl\" \"python.jsonl\" \"--fault\" \"slow-drip\")
+
+The result is what a profile assigns to the package's own \"how do I
+launch my backend\" option, which is the whole point: the package
+launches its backend exactly as it always does, and never learns that
+the thing on the other end of the pipe is a fixture."
+  (cons eh-fake-bridge
+        (mapcan (lambda (arg)
+                  ;; Keyed off the extension, not off "does not start with
+                  ;; a dash": the latter swallows a flag's *argument*
+                  ;; ("--fault" "stderr-noise") as a script name, and the
+                  ;; bridge then dies on a missing file with the fault
+                  ;; silently never applied.
+                  (if (and (stringp arg) (string-suffix-p ".jsonl" arg))
+                      (list "--script"
+                            (expand-file-name arg eh-profile-bridge-scripts-dir))
+                    (list arg)))
+                args)))
 
 ;;; ---------------------------------------------------------------------
 ;;; the macro

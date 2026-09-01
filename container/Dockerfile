@@ -57,7 +57,8 @@ COPY container/supervisord.conf /etc/supervisor/supervisord.conf
 COPY container/eh-programs.conf /etc/supervisor/conf.d/eh-programs.conf
 COPY profiles/ /srv/profiles/
 
-RUN chmod +x /opt/eh/bin/eh /opt/eh/ehd/ehd.py /opt/eh/ehd/ehd_cli.py \
+RUN chmod +x /opt/eh/bin/eh /opt/eh/bin/eh-fake-bridge \
+             /opt/eh/ehd/ehd.py /opt/eh/ehd/ehd_cli.py \
              /usr/local/bin/ehd-cli /usr/local/bin/ehd-server \
              /opt/eh/container/entrypoint.sh /opt/eh/container/bootstrap-server.sh \
     && mkdir -p /run/eh /var/lib/eh/runs /var/lib/eh/elpa-cache /var/log/eh

@@ -316,6 +316,7 @@ def _session_init_el(*, session_name: str, run_dir: Path, profile_dir: Path,
 (setq eh-frame-font "{font}")
 (setq eh-profile-dir "{profile_dir}")
 (setq eh-profile-fixtures-dir "{profile_dir / 'fixtures'}")
+(setq eh-profile-bridge-scripts-dir "{profile_dir / 'bridge-scripts'}")
 (setq eh-profile-scratch-dir (expand-file-name "workdir" eh-run-dir))
 (setq eh-session-theme {theme_lisp})
 (setq eh-session-geometry "{width}x{height}")
