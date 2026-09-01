@@ -129,6 +129,10 @@ class SessionManager:
         scratch_home = SCRATCH_ROOT / f"eh-scratch-{name}"
         for p in (run_dir / "in", run_dir / "out", scratch_home / "emacs.d"):
             p.mkdir(parents=True, exist_ok=True)
+        # `run_dir` doubles as Emacs's `server-socket-dir` (§6.2); server.el's
+        # server-ensure-safe-dir refuses to bind the socket there unless it is
+        # 0700, and a plain mkdir() leaves it group/other-readable per umask.
+        os.chmod(run_dir, 0o700)
 
         env = dict(os.environ, DISPLAY=f":{display}")
         width, height = (geometry.split("x") + ["800"])[:2]
@@ -266,7 +270,7 @@ _OPENBOX_RC = """<?xml version="1.0" encoding="UTF-8"?>
   <mouse></mouse>
   <theme><name>Clearlooks</name><titleLayout></titleLayout></theme>
   <applications>
-    <application class="*"><decor>no</decor><maximized>yes</maximized></application>
+    <application class="*"><decor>no</decor></application>
   </applications>
 </openbox_config>
 """

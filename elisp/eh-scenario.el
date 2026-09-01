@@ -52,8 +52,8 @@ Used by `:needs (:kernel ...)' to decide skip vs run.")
            do (pcase key
                 (:emacs (unless (eh--version-satisfies val)
                           (cl-return (format "needs emacs %s, have %s" val emacs-version))))
-                (:cairo (unless (and (fboundp 'x-export-frames) val)
-                          (cl-return "needs a cairo build")))
+                (:cairo (unless (and (fboundp 'x-export-frames) (display-graphic-p) val)
+                          (cl-return "needs a cairo build with a live graphical frame")))
                 (:svg (unless (image-type-available-p 'svg)
                         (cl-return "needs SVG image support")))
                 (:kernel (unless (member val eh-available-kernels)
@@ -120,8 +120,20 @@ and find-file it there.  Never opens the read-only profile copy."
              (eh--scenario-teardown buffers-before)))))))
 
 (defun eh--scenario-teardown (buffers-before)
+  "Kill every buffer the scenario created.  A fixture buffer is disposable
+scratch state by design (DESIGN §5.3/§8.2: fixtures are copied into
+scratch precisely so they are safe to discard), so this must be
+unconditional: `kill-buffer' on a modified buffer would otherwise ask
+\"kill anyway?\" via `yes-or-no-p', which the prompt guard (§6.5) turns
+into a signalled error under `eh-strict-prompts' -- and the old
+`ignore-errors' here swallowed exactly that error, leaving the buffer
+alive and modified for the *next* scenario's same-named fixture to
+collide with (`find-file' on an externally-touched file with unsaved
+edits triggers `ask-user-about-supersession-threat', which hits the
+guard again, this time uncaught)."
   (dolist (b (buffer-list))
     (unless (or (memq b buffers-before) (not (buffer-live-p b)))
+      (with-current-buffer b (set-buffer-modified-p nil))
       (let ((kill-buffer-query-functions nil))
         (ignore-errors (kill-buffer b))))))
 
@@ -138,12 +150,18 @@ the signal that caused the abnormal exit."
     (dolist (b (buffer-list))
       (with-current-buffer b
         (unless (string-prefix-p " " (buffer-name))
-          (with-temp-file (expand-file-name
-                            (format "snapshot-%s.el"
-                                    (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" (buffer-name)))
-                            dir)
-            (insert (eh--prin1-to-string-unlimited
-                     (ignore-errors (eh-snapshot :buffer (buffer-name) :window t))))))))
+          ;; Capture the name and snapshot *before* `with-temp-file' below,
+          ;; which rebinds (current-buffer) to its own internal " *temp
+          ;; file*" buffer for the extent of its body -- calling
+          ;; `(buffer-name)'/`eh-snapshot' from inside that body silently
+          ;; snapshots the wrong buffer instead of B.
+          (let ((name (buffer-name))
+                (snapshot (ignore-errors (eh-snapshot :buffer (buffer-name) :window t))))
+            (with-temp-file (expand-file-name
+                              (format "snapshot-%s.el"
+                                      (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" name))
+                              dir)
+              (insert (eh--prin1-to-string-unlimited snapshot)))))))
     (when (display-graphic-p)
       (ignore-errors (eh-shot-to-file (expand-file-name "failure.png" dir))))))
 

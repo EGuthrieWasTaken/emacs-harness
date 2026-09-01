@@ -51,10 +51,6 @@ Looked up by `eh wait NAME'.")
   (let ((width (or width 1280))
         (height (or height 800))
         (font (or font "DejaVu Sans Mono-11")))
-    (when (display-graphic-p)
-      (set-frame-size (selected-frame) width height t)
-      (ignore-errors (set-frame-font font t t))
-      (setq frame-resize-pixelwise t))
     (setq-default line-spacing nil)
     (setq face-font-rescale-alist nil)
     (setq image-scaling-factor 1.0)
@@ -65,12 +61,46 @@ Looked up by `eh wait NAME'.")
           use-file-dialog nil)
     (when (boundp 'x-gtk-use-system-tooltips)
       (setq x-gtk-use-system-tooltips nil))
+    ;; Strip every bit of frame chrome *before* the final pixel-exact
+    ;; resize below: toggling tool-bar/menu-bar/scroll-bar-mode changes how
+    ;; much of the frame's pixel width is text area vs. chrome, so doing it
+    ;; afterward perturbs the geometry `set-frame-size' just fixed (DESIGN
+    ;; §12's "frame-geometry exact" doctor check exists to catch this).
     (when (fboundp 'blink-cursor-mode) (blink-cursor-mode -1))
     (when (fboundp 'tool-bar-mode) (tool-bar-mode -1))
     (when (fboundp 'menu-bar-mode) (menu-bar-mode -1))
     (when (fboundp 'scroll-bar-mode) (scroll-bar-mode -1))
     (when (fboundp 'horizontal-scroll-bar-mode) (horizontal-scroll-bar-mode -1))
     (when (fboundp 'tooltip-mode) (tooltip-mode -1))
+    (when (display-graphic-p)
+      (setq frame-resize-pixelwise t)
+      (ignore-errors (set-frame-font font t t))
+      ;; On at least the GTK toolkit build, `scroll-bar-mode -1' hides the
+      ;; bar (sets `vertical-scroll-bars' to nil) but the toolkit still
+      ;; reserves `scroll-bar-width' pixels of gutter that count toward
+      ;; `frame-pixel-width' -- neither `set-frame-parameter' nor giving
+      ;; `scroll-bar-width' as 0 in a fresh frame's own creation alist can
+      ;; get it below that floor (both were tried and measured). What *is*
+      ;; reliable: requesting WIDTH always yields exactly
+      ;; (+ WIDTH scroll-bar-width) -- confirmed by probing several
+      ;; requested widths and observing the same fixed offset every time.
+      ;; So undersize the request by that (queryable, environment-specific)
+      ;; amount and let the toolkit's own overhead bring it back to WIDTH.
+      (let ((overhead (or (frame-parameter (selected-frame) 'scroll-bar-width) 0)))
+        (set-frame-size (selected-frame) (max 1 (- width overhead)) height t))
+      ;; `set-frame-size' only *requests* the resize; on X11/GTK the frame's
+      ;; pixel dimensions don't actually update until Emacs processes the
+      ;; window manager's ConfigureNotify confirming it, which needs the
+      ;; event loop pumped. A caller that inspects `frame-pixel-width'
+      ;; immediately afterward (as `eh-doctor' does, right at session
+      ;; startup with nothing else yet run to pump events as a side
+      ;; effect) can otherwise see a stale, pre-resize size.
+      (let ((deadline (+ (float-time) 2)))
+        (while (and (< (float-time) deadline)
+                    (not (and (= (frame-pixel-width) width)
+                              (= (frame-pixel-height) height))))
+          (redisplay t)
+          (sit-for 0.05))))
     (setq make-backup-files nil
           auto-save-default nil
           create-lockfiles nil)
@@ -697,8 +727,12 @@ ALL non-nil, accept every *.actual.png found in OUT-DIR (default
 
 (defun eh-doctor ()
   (let* ((graphic (display-graphic-p))
+         ;; `system-configuration-features' reports upper-case feature names
+         ;; ("CAIRO", not "cairo"); `member' is case-sensitive, so comparing
+         ;; against the lower-case literal always misses even on a build
+         ;; that has it.
          (cairo (and (fboundp 'x-export-frames)
-                     (member "cairo" (split-string system-configuration-features))))
+                     (member "cairo" (mapcar #'downcase (split-string system-configuration-features)))))
          (export-ok
           (and (fboundp 'x-export-frames)
                (ignore-errors
@@ -706,7 +740,10 @@ ALL non-nil, accept every *.actual.png found in OUT-DIR (default
                    (and bytes (> (length bytes) 1024)
                         (string-prefix-p "\x89PNG" bytes))))))
          (coord (ignore-errors (eh-display-xy (point-min))))
-         (scaling (eq image-scaling-factor 1.0))
+         ;; `eq' on floats compares object identity, not value -- two 1.0
+         ;; floats from different places are frequently not `eq' even though
+         ;; they are `='.
+         (scaling (= image-scaling-factor 1.0))
          (font-name (ignore-errors
                       (font-get (face-attribute 'default :font) :name))))
     (vconcat
@@ -726,10 +763,19 @@ ALL non-nil, accept every *.actual.png found in OUT-DIR (default
       (eh--check "image-scaling-factor-pinned" scaling (format "%s" image-scaling-factor))
       (eh--check "font-resolved" (and font-name t) (format "%s" font-name))
       (eh--check "frame-geometry"
-                 (and graphic (= (frame-pixel-width) (* (frame-width)
-                                                         (default-font-width))
-                                 ))
-                 "best-effort; see eh describe for exact pixel geometry")
+                 ;; DESIGN §12: compare the actual pixel geometry against
+                 ;; the *requested* values (set via `eh-apply-determinism-settings'
+                 ;; -> `set-frame-size ... t', i.e. pixelwise), not a
+                 ;; recomputed char-width*column approximation -- integer
+                 ;; rounding there makes it fail even on an exact frame.
+                 (and graphic
+                      (boundp 'eh-frame-width) (boundp 'eh-frame-height)
+                      (= (frame-pixel-width) eh-frame-width)
+                      (= (frame-pixel-height) eh-frame-height))
+                 (format "%sx%s, requested %sx%s"
+                         (and graphic (frame-pixel-width)) (and graphic (frame-pixel-height))
+                         (and (boundp 'eh-frame-width) eh-frame-width)
+                         (and (boundp 'eh-frame-height) eh-frame-height)))
       (eh--check "clock-is-utc" (equal (getenv "TZ") "UTC") (format "%s" (getenv "TZ")))))))
 
 (defun eh-doctor-json () (eh--raw-json (json-encode (eh-doctor))))
