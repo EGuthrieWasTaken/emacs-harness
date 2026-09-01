@@ -17,22 +17,35 @@ and the core is deliberately generic — proven by the fact that
 
 ## Status
 
-**Phases 0-2 implemented, phase 3 mostly implemented** (see DESIGN.md §14).
-Phase 0-1: the container image, the `ehd` dispatcher, the `eh` client, the
-Elisp driver (`eh-driver.el`), the scenario DSL (`eh-scenario.el`), and the
-`smoke` profile that proves the core is package-agnostic. Phase 2: `eh
+**Phases 0-3 implemented, and phases 2-3's own DESIGN §14 acceptance tests
+now formally proven end-to-end** against a live `emacs-gtk` + `Xvfb` +
+`openbox` (not just wired up and assumed correct — see below). Phase 0-1:
+the container image, the `ehd` dispatcher, the `eh` client, the Elisp driver
+(`eh-driver.el`), the scenario DSL (`eh-scenario.el`), and the `smoke`
+profile that proves the core is package-agnostic. Phase 2: `eh
 click`/`eh drag`/`eh scroll`/`eh keys --x`, `eh video` (including `--gif`),
 and pixel baselines via `eh diff-shot`/`eh baseline accept` with
 `.mask.json` sidecar support, all wired end-to-end including the
-scenario-level `eh-expect-no-visual-drift`. Phase 3: the `--emacs V,...`
-matrix flag on `eh run` and a GitHub Actions workflow
-(`.github/workflows/ci.yml`) that builds the image and runs `eh doctor` +
-`eh run smoke` headlessly. Not yet built: any profile beyond `smoke` itself
-(so the matrix flag's second acceptance test, "`eh run <profile> --emacs
-27.2,29.4` for a real profile", can't be run end-to-end until one exists),
-pinned multi-version Emacs *images* (the matrix flag works against whatever
-binaries you point it at, but this repo doesn't build or ship `27.2`/`29.4`
-binaries — see DESIGN §13.3 open question 1), and the MCP server (Phase 4).
+scenario-level `eh-expect-no-visual-drift`. **Phase 2's own acceptance
+test** — "a scenario clicks on the third slice of a tall inline image by
+buffer position... and `eh diff-shot` fails on a one-pixel change and
+passes on a rerun" — is now proven directly, not just plumbed: see
+`smoke/image-slices-are-addressable` and
+`smoke/diff-shot-detects-pixel-change` under "What's been validated" below.
+Phase 3: the `--emacs V,...` matrix flag on `eh run` and a GitHub Actions
+workflow (`.github/workflows/ci.yml`) that builds the image and runs `eh
+doctor` + `eh run smoke` headlessly. **Phase 3's matrix mechanism** is now
+verified against the real dispatcher (previously only exercised with a
+mocked `SessionManager` — see below for a real bug that mock missed). Not
+yet built: any profile beyond `smoke` itself (so the matrix flag's second
+acceptance test, "`eh run <profile> --emacs 27.2,29.4` for a real profile",
+can't be run end-to-end until one exists), pinned multi-version Emacs
+*images* (the matrix flag's own control flow is now proven against two
+distinctly-named binaries, but this environment — like every environment
+this harness has been driven in so far — has exactly one real Emacs release
+installed, so *different Emacs versions actually disagreeing on something*
+remains unexercised; see DESIGN §13.3 open question 1), and the MCP server
+(Phase 4).
 
 Diff-shot's pixel comparison (ImageMagick `compare`/`identify`, plus mask
 rectangles applied via `convert -draw`) is implemented once, in Elisp
@@ -161,15 +174,84 @@ access — it should already be all green.
   `eh-scroll-pixels`, which falls back to `set-window-vscroll` (24+) when
   the precision-scroll functions aren't available.
 - The `--emacs V,...` matrix control flow in `ehd.py` (`handle_run` /
-  `_run_one_version`) was exercised with a mocked `SessionManager`: a single
-  version still returns the old flat (non-`matrix`) response shape; a
-  matrix with one version whose Emacs binary doesn't exist still runs and
-  reports the other versions rather than aborting the whole matrix; a
-  scenario failure (not a session-creation failure) still cleans up its
-  session; and `mgr.rm` failures during cleanup no longer escape the
-  `finally` block and clobber a good result (a latent bug in the original
-  single-version code path, fixed as part of this change since both paths
-  now share the same function).
+  `_run_one_version`) was originally exercised only with a mocked
+  `SessionManager`. Re-run against the *real* dispatcher (two names on
+  `PATH` pointing at the one real Emacs binary available, since no second
+  genuine release is installed anywhere this harness has been driven so
+  far) it found a real bug the mock's abstraction had hidden: a bad
+  `--emacs` binary makes `subprocess.Popen` raise a plain `OSError`
+  (`FileNotFoundError`), which isn't an `EhError`, so `_run_one_version`'s
+  `except EhError` didn't catch it — it escaped uncaught and killed the
+  *entire* matrix response (`internal ehd error`) instead of reporting that
+  one version's failure and continuing, exactly contradicting the mock
+  test's own (now corrected) claim and the code's own comment. It also
+  leaked the Xvfb/openbox processes that version's session had already
+  started, since nothing killed them on the way out. Fixed by catching
+  `OSError` around the Emacs launch in `SessionManager.new`, killing the
+  orphaned Xvfb/openbox first. Re-verified for real: `eh run smoke --emacs
+  A,B` runs the full suite independently under both names and reports a
+  per-version `matrix`; `eh run smoke --emacs A,bogus-binary` now correctly
+  reports one version's real results alongside the other's clean failure,
+  with the top-level `ok` false and the run continuing rather than dying.
+- **`eh-run-scenarios-json` (the Elisp side of `eh run`, in
+  `eh-scenario.el`) could not survive a single scenario failing or
+  skipping.** It delegated to `ert-run-tests-batch`, which relies on ERT
+  installing its own `debugger` binding around each test
+  (`ert--run-test-internal`) to catch `ert-fail`/`ert-skip` without
+  unwinding the stack. That binding is never consulted here: `eh run`
+  arrives over `emacsclient --eval`, which runs inside
+  `server-process-filter`'s dynamic extent, and `server.el` wraps that
+  whole call in its own blanket `condition-case` (`(t (server-return-error
+  proc err))`) — Emacs resolves a signal to the nearest enclosing
+  `condition-case` *before* ever consulting `debug-on-error`/`debugger`, so
+  server.el's handler always won first. In practice this meant *any*
+  scenario failure or skip — not just a misreported result, the entire
+  batch — escaped uncaught, killing the whole session with "session
+  unreachable" instead of landing in the JSON summary. Every scenario
+  written before this pass happened to pass, so this had never fired.
+  (This is a known upstream ERT limitation, not specific to this harness —
+  `ert.el` itself carries a FIXME citing Bug#24402/Bug#11218 about moving
+  off the `debugger` hook onto `signal-hook-function`, which as of the
+  Emacs used here it has not done.) Fixed by no longer delegating to
+  `ert-run-tests-batch` at all: `eh-run-scenarios-json` now selects tests
+  via `ert-select-tests` and runs each one directly, wrapped in a plain
+  `condition-case` — which *does* resolve correctly in this context, since
+  it is the same mechanism server.el's own handler uses and Emacs finds the
+  innermost one first. Re-verified with a live daemon (bypassing `ehd.py`
+  entirely, driving `emacsclient --eval` by hand against a from-scratch
+  `server-start`'d Emacs) on a synthetic pass/fail/skip mix, then against
+  the real `smoke` suite twice from cold sessions.
+- Two new permanent scenarios in `profiles/smoke/scenarios/smoke.el` prove
+  DESIGN §14 phase 2's literal acceptance test, which had only been
+  plumbed, not exercised, before this pass:
+  - `smoke/image-slices-are-addressable` inserts a real tall PNG fixture
+    (`tall-stripes.png`, five distinct 100px bands) via the built-in
+    `insert-sliced-image` and asserts, via `eh-snapshot`, that each slice
+    is a separately addressable run with correct, monotonically increasing
+    pixel geometry — the position math `eh click`'s "click the third slice"
+    interactive test (separately verified live via real `xdotool` clicks,
+    not scenario-expressible per DESIGN §8.1 tier 2b) depends on. Getting
+    the assertions right surfaced and fixed a real decoding gap:
+    `eh--display-descriptor` didn't recognise the `((slice X Y W H) (image
+    ...))` wrapper form `insert-sliced-image` actually produces (only the
+    `(image :slice ...)` plist form), and `eh-expect-display-image`'s
+    `:slices` check was a silent no-op that never actually failed on a
+    mismatch.
+  - `smoke/diff-shot-detects-pixel-change` proves `eh-diff-shot` "fails on
+    a one-pixel change and passes on a rerun" without committing a baseline
+    PNG to the repo: baselines are keyed per Emacs-version/geometry/theme
+    (§8.4), so a baseline captured in any one sandbox would only ever match
+    that exact environment and silently skip everywhere else, proving
+    nothing in CI. Instead it points `eh-baseline-dir` at a scratch
+    directory for its own duration, accepts a screenshot of the current
+    frame as that scratch baseline via the real `eh-baseline-accept`, then
+    asserts against it with the real `eh-diff-shot`: unchanged, it passes
+    with zero changed pixels; after a real, visible edit, it fails with a
+    nonzero count. A companion scenario,
+    `smoke/visual-drift-skips-without-baseline`, asserts that
+    `eh-expect-no-visual-drift` itself `ert-skip`s (not fails, not silently
+    passes) for a name that will never have an accepted baseline — the
+    ordinary case for a freshly-run profile.
 - What's *still not* validated here: `docker build` itself (blocked by
   egress policy, see above), `ffmpeg` video/gif capture, and the browser
   view (x11vnc/websockify/noVNC) — none of those were exercised in this

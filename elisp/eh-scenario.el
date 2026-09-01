@@ -237,19 +237,29 @@ is the behaviour; the read-only property is only the mechanism."
                            (if message (concat message ": ") "") beg end prop val))))))
 
 (cl-defun eh-expect-display-image (pos &key type slices min-width message)
-  (let ((disp (get-char-property pos 'display)))
-    (unless (and (consp disp) (eq (car disp) 'image))
+  "Assert POS carries an image display property.  Recognizes both Emacs
+display-property shapes for a sliced image: a plain image spec with its
+own :slice plist key, and `insert-sliced-image''s `((slice X Y W H)
+IMAGE-SPEC)' wrapper form.  With SLICES non-nil, additionally assert POS
+is part of a sliced sequence (either shape)."
+  (let* ((disp (get-char-property pos 'display))
+         (wrapper-sliced (and (consp disp) (consp (car disp)) (eq (caar disp) 'slice)
+                               (consp (cadr disp)) (eq (car (cadr disp)) 'image)))
+         (image-spec (cond (wrapper-sliced (cadr disp))
+                            ((and (consp disp) (eq (car disp) 'image)) disp))))
+    (unless image-spec
       (ert-fail (format "%sno image display property at %d" (if message (concat message ": ") "") pos)))
     (when type
-      (unless (eq (plist-get (cdr disp) :type) type)
-        (ert-fail (format "expected image type %s, got %s" type (plist-get (cdr disp) :type)))))
+      (unless (eq (plist-get (cdr image-spec) :type) type)
+        (ert-fail (format "expected image type %s, got %s" type (plist-get (cdr image-spec) :type)))))
     (when min-width
-      (let ((size (image-size disp t)))
+      (let ((size (image-size image-spec t)))
         (unless (>= (car size) min-width)
           (ert-fail (format "expected width >= %d, got %d" min-width (car size))))))
     (when slices
-      (unless (eq (plist-get (cdr disp) :slice) slices)
-        t))))
+      (unless (or wrapper-sliced (plist-get (cdr image-spec) :slice))
+        (ert-fail (format "%sposition %d is not part of a sliced image"
+                           (if message (concat message ": ") "") pos))))))
 
 (defun eh-expect-visible (pos &optional message)
   (unless (pos-visible-in-window-p pos)
@@ -275,9 +285,19 @@ is the behaviour; the read-only property is only the mechanism."
   "Screenshot the frame and assert it matches the profile's baseline for
 NAME under the session's Emacs version/geometry/theme (§6.4, §8.3).
 Artifacts (actual/diff PNGs) land in this scenario's artifact directory,
-so a failure's screenshots are in the same place as its other artifacts."
+so a failure's screenshots are in the same place as its other artifacts.
+
+A missing baseline `ert-skip's rather than fails: a baseline is keyed
+per Emacs-version/geometry/theme (§8.4), and the same profile is
+routinely run across several of each (§14 phase 3's matrix), so \"no
+baseline for this combination yet\" is an expected, unestablished
+state -- not a regression -- until an agent runs `eh baseline accept'
+for it. A real pixel mismatch against an *existing* baseline still
+fails, same as always."
   (let ((r (eh-diff-shot name :tolerance tolerance :mask mask
                           :out-dir (eh--scenario-artifact-dir eh-current-scenario-name))))
+    (when (plist-get r :no-baseline)
+      (ert-skip (format "%s%s" (if message (concat message ": ") "") (plist-get r :error))))
     (unless (plist-get r :ok)
       (ert-fail
        (format "%svisual drift in %s: %s"
@@ -309,55 +329,58 @@ so a failure's screenshots are in the same place as its other artifacts."
 ;;; ---------------------------------------------------------------------
 ;;; `eh run' entry point
 
-(defun eh--test-result-status (result)
-  (cond ((ert-test-passed-p result) "passed")
-        ((and (fboundp 'ert-test-skipped-p) (ert-test-skipped-p result)) "skipped")
-        (t "failed")))
-
-(defun eh--test-result-message (result status)
-  "`ert-test-skipped' and `ert-test-failed' are siblings, not one a
-subtype of the other, so only the shared base struct's accessor works
-on both -- `ert-test-failed-condition' raises `wrong-type-argument' on
-a skip result."
-  (ignore-errors
-    (pcase status
-      ((or "failed" "skipped")
-       (format "%S" (ert-test-result-with-condition-condition result)))
-      (_ nil))))
-
-(defun eh--test-result-duration (result)
-  (or (ignore-errors (ert-test-result-duration result)) 0))
-
 (defun eh-run-scenarios-json (files selector run-dir)
   "Load FILES (scenario .el files), run tests matching SELECTOR (a string
 read as an ERT selector, or nil for all `eh-scenario' tests), and return
-a JSON summary.  RUN-DIR becomes `eh-artifacts-root' for failure capture."
+a JSON summary.  RUN-DIR becomes `eh-artifacts-root' for failure capture.
+
+Deliberately does *not* delegate to `ert-run-tests-batch': that relies on
+ERT's own per-test catching, which installs a custom `debugger' binding
+around each test body (see `ert--run-test-internal').  That mechanism is
+never reached here -- `eh run' arrives via `emacsclient --eval', which
+executes inside `server-process-filter''s dynamic extent, and that
+function wraps the whole request in its own blanket `condition-case'
+\(`(t (server-return-error proc err))'); Emacs resolves a signal to the
+*nearest enclosing `condition-case'*, found before `debug-on-error' or
+`debugger' is ever consulted, so server.el's handler always wins first
+and every test's failure or skip -- not just this run's, the *entire*
+`ert-run-tests-batch' call -- would escape uncaught, killing the whole
+session instead of landing in the JSON below.  This is a known upstream
+limitation, not a bug in that Emacs's own ERT carries a FIXME about
+(Bug#24402, Bug#11218): it plans to move off the `debugger' hook onto
+`signal-hook-function' but has not, as of this Emacs, done so.  A plain
+`condition-case' *does* resolve correctly in this context (it is what
+server.el's own handler uses), so tests are selected via
+`ert-select-tests' and run one at a time, each wrapped in one here."
   (setq eh-artifacts-root run-dir)
   (dolist (f files) (load f nil t))
   (let* ((sel (if (and selector (not (string-empty-p selector)))
                    (read selector)
                  '(tag eh-scenario)))
-         (stats (let ((ert-quiet t)) (ert-run-tests-batch sel)))
-         (n (length (ert--stats-tests stats)))
+         (tests (ert-select-tests sel t))
          (results nil))
-    (dotimes (i n)
-      (let* ((test (aref (ert--stats-tests stats) i))
-             (result (aref (ert--stats-test-results stats) i))
-             (status (eh--test-result-status result))
-             (msg (eh--test-result-message result status)))
-        (when (member status '("failed" "skipped"))
-          (with-temp-file (expand-file-name "backtrace.txt"
-                                             (eh--scenario-artifact-dir (ert-test-name test)))
-            (insert (or msg "") "\n")))
-        (push `((name . ,(format "%s" (ert-test-name test)))
-                (status . ,status)
-                (duration_ms . ,(round (* 1000 (eh--test-result-duration result))))
-                ,@(if msg `((message . ,msg)) nil))
-              results)))
+    (dolist (test tests)
+      (let ((name (ert-test-name test))
+            (start (float-time))
+            status msg)
+        (condition-case err
+            (progn (funcall (ert-test-body test)) (setq status "passed"))
+          (ert-test-skipped (setq status "skipped" msg (format "%S" err)))
+          (error (setq status "failed" msg (format "%S" err))))
+        (let ((duration-ms (round (* 1000 (- (float-time) start)))))
+          (when (member status '("failed" "skipped"))
+            (with-temp-file (expand-file-name "backtrace.txt"
+                                               (eh--scenario-artifact-dir name))
+              (insert (or msg "") "\n")))
+          (push `((name . ,(format "%s" name))
+                  (status . ,status)
+                  (duration_ms . ,duration-ms)
+                  ,@(if msg `((message . ,msg)) nil))
+                results))))
     (setq results (nreverse results))
     (eh--raw-json
      (json-encode
-      `((total . ,n)
+      `((total . ,(length results))
         (passed . ,(cl-count "passed" results :key (lambda (r) (cdr (assq 'status r))) :test #'string=))
         (failed . ,(cl-count "failed" results :key (lambda (r) (cdr (assq 'status r))) :test #'string=))
         (skipped . ,(cl-count "skipped" results :key (lambda (r) (cdr (assq 'status r))) :test #'string=))
