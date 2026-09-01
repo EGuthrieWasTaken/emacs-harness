@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""eh-fake-bridge -- a scriptable stand-in for a package's backend process.
+
+DESIGN.md Section 9.2.  A large class of backend-talking behaviour is
+impossible or miserable to trigger against a real backend: a half-open
+connection, a request that never gets answered, a reply truncated
+mid-JSON, a backend that dies in the middle of writing.  This script
+speaks a line-oriented JSON protocol on stdin/stdout and does whatever a
+.jsonl script tells it to, on demand and to the byte.
+
+It knows nothing about any particular package.  What it knows is the
+*shape* almost every such protocol shares:
+
+  * a request is one JSON object per line, carrying a correlation id;
+  * a reply is one JSON object per line, carrying the same id;
+  * some traffic is out-of-band -- incremental output attached to a
+    request still in flight, or an unsolicited asynchronous event.
+
+Which JSON *keys* carry those three things differs per package, so they
+are configurable (--id-key / --method-key / --params-key, and the
+`emit' item keys in the script).  Everything else is generic.
+
+Usage
+-----
+
+    eh-fake-bridge --script FILE.jsonl [--script MORE.jsonl ...]
+                   [--fault NAME] [--log FILE]
+                   [--id-key id] [--method-key method] [--params-key params]
+                   [--unmatched error|empty|never]
+
+    eh-fake-bridge --record OUT.jsonl -- REAL-BACKEND-COMMAND [ARGS...]
+
+Any other command-line argument is ignored, deliberately: a profile
+points the package's own "how do I launch my backend" option at this
+script, and the package will append its own flags (a URL, a token, a
+timeout) that it expects its real backend to understand.  Ignoring them
+is what lets the substitution be invisible to the package under test.
+
+Script format
+-------------
+
+One JSON object per line.  Blank lines, and lines whose first
+non-whitespace character is `#' or `//', are ignored.  Two kinds of
+object:
+
+**Rules** match an incoming request.  Checked in file order (across all
+--script files, concatenated); first match wins.
+
+    {"on":     {"method": "execute", "code": "~^for i in~"},
+     "delay_ms": 50,
+     "emit":  [{"after_ms":   0, "event":  {"type":"status","execution_state":"busy"}},
+               {"after_ms": 100, "output": {"type":"stream","name":"stdout","text":"step 1\n"}},
+               {"after_ms": 310, "output": {"type":"display_data",
+                                            "data":{"image/png":{"$file":"plot.png"}}}}],
+     "reply": {"outputs": "<repeat-all-emitted>", "execution_count": 1}}
+
+  `on'        every key must match the request.  `method' is matched
+              against the request's method; every other key is matched
+              against that key in the request's params.  A value wrapped
+              in tildes (`"~^for i in~"') is a regular expression
+              searched against the value as a string; anything else must
+              be equal.  `{"on": {}}' matches every request -- useful as
+              a catch-all last rule.
+  `reply'     becomes the reply's `result'.  The string
+              "<repeat-all-emitted>", used as a value or as a list
+              element, expands to the list of output payloads this rule
+              emitted for this request -- real backends routinely repeat
+              streamed chunks in the final combined reply, and getting
+              that reconciliation wrong is a real bug class.
+  `error'     replies with an `error' object instead of a result.
+  `delay_ms'  wait this long before replying (after the emits).
+  `emit'      out-of-band traffic, each item scheduled `after_ms' from
+              when the request arrived.  An item carries exactly one of
+              `output' (attached to this request's id), `event' (no id;
+              a top-level `kernel_id'-style routing key may sit beside
+              it) or `input_request' (attached to this request's id;
+              the package is expected to answer on stdin).
+  `never_reply'  emit as scripted, then leave the request hanging
+              forever -- the wedged-request case.
+  `fault'     apply a fault (see below) to this rule's reply.
+  `times'     how many times this rule may match before it is retired
+              and later rules get a look in; default unlimited.
+
+A rule may match on `on_input' instead of `on'.  Those match a line the
+client sent that is *not* a request -- the answer to an
+`input_request', typically -- against the line's own top-level keys:
+
+    {"on_input": {"input": "~.~"},
+     "emit": [{"after_ms": 0, "output": {"type":"stream","text":"got it\n"}}]}
+
+Correlation is by id alone on such a line, so without this the fake
+could pose a question and never react to the answer, leaving the
+interesting half of that exchange untestable.  An `on_input' rule with
+no `reply' emits and stops, rather than inventing a reply line no real
+backend would send.
+
+**Injections** fire on a wall-clock schedule from bridge start,
+independent of any request -- the "something else killed the backend"
+case:
+
+    {"at": "t+2000", "inject": {"event": {"type":"dead"}, "kernel_id":"k1"}}
+
+Anywhere in an emitted or injected payload, `{"$file": "PATH"}' is
+replaced by the file's contents: base64 for anything that isn't valid
+UTF-8 (an image), the text itself otherwise.  PATH resolves relative to
+the script file that named it.
+
+Faults
+------
+
+`--fault NAME' applies to the first reply written; a rule's own
+`"fault"' key applies to that rule's reply and takes precedence.
+
+  truncate-json   write the first half of the reply, then a newline
+  no-newline      write the reply with no trailing newline
+  slow-drip       write the reply one byte at a time, 20ms apart
+  die-mid-reply   write half the reply and exit(1) immediately
+  stderr-noise    (global only) chatter on stderr throughout, to prove
+                  the package keeps the backend's stderr out of the
+                  protocol on stdout
+  invalid-utf8    write a reply containing a raw invalid UTF-8 byte
+  garbage-line    write a non-JSON line before the reply
+
+Record mode
+-----------
+
+    eh-fake-bridge --record out.jsonl -- python3 -m realbackend --url ...
+
+Proxies stdin/stdout to the real backend, passing everything through
+unchanged, and writes a replayable script of what actually crossed the
+wire, with binary payloads spilled to `out.jsonl.d/'.  Every fixture
+should start as real traffic and be hand-edited afterwards; fixtures
+built from a protocol spec are how a suite ends up passing against a
+fiction.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+
+# ---------------------------------------------------------------------
+# output side: one lock around stdout, because emits are scheduled on
+# timers and a reply can be written from the reader thread at the same
+# moment.  Interleaved bytes would be a bug in the harness masquerading
+# as a bug in the package under test.
+
+class Writer:
+    def __init__(self, stream, log=None):
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._log = log
+        self._replies_written = 0
+
+    def line(self, obj):
+        self.raw(json.dumps(obj, separators=(",", ":")) + "\n")
+
+    def raw(self, text, encode=True):
+        data = text.encode("utf-8") if encode else text
+        with self._lock:
+            self._stream.buffer.write(data)
+            self._stream.buffer.flush()
+        self.log(("-> %s" % text.rstrip("\n")) if encode else "-> <raw bytes>")
+
+    def reply(self, obj, fault=None):
+        """Write a reply line, mangled by FAULT if one is in force."""
+        text = json.dumps(obj, separators=(",", ":")) + "\n"
+        self._replies_written += 1
+
+        if fault == "truncate-json":
+            self.raw(text[: max(1, len(text) // 2)] + "\n")
+        elif fault == "no-newline":
+            self.raw(text.rstrip("\n"))
+        elif fault == "garbage-line":
+            self.raw("this is not JSON and never was\n")
+            self.raw(text)
+        elif fault == "invalid-utf8":
+            half = text[: max(1, len(text) // 2)].encode("utf-8")
+            self.raw(half + b"\xff\xfe" + text[len(half) :].encode("utf-8"), encode=False)
+        elif fault == "slow-drip":
+            for ch in text:
+                self.raw(ch)
+                time.sleep(0.02)
+        elif fault == "die-mid-reply":
+            self.raw(text[: max(1, len(text) // 2)])
+            self.log("!! die-mid-reply: exiting")
+            os._exit(1)
+        else:
+            self.raw(text)
+
+    def replies_written(self):
+        with self._lock:
+            return self._replies_written
+
+    def log(self, message):
+        if self._log:
+            self._log.write("%.3f %s\n" % (time.time(), message))
+            self._log.flush()
+
+
+# ---------------------------------------------------------------------
+# script loading
+
+class ScriptError(Exception):
+    pass
+
+
+def _expand_files(value, base_dir):
+    """Replace every {"$file": PATH} in VALUE with the file's contents."""
+    if isinstance(value, dict):
+        if set(value.keys()) == {"$file"}:
+            path = os.path.join(base_dir, value["$file"])
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            try:
+                return blob.decode("utf-8")
+            except UnicodeDecodeError:
+                return base64.b64encode(blob).decode("ascii")
+        return {k: _expand_files(v, base_dir) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_files(v, base_dir) for v in value]
+    return value
+
+
+def load_scripts(paths):
+    """Return (rules, injections) read from PATHS in order.
+
+    One object per line is the format, but an object may be spread over
+    several lines: incomplete text is held and re-parsed with the next
+    line appended.  A rule with half a dozen scheduled emits is
+    unreadable crammed onto one line, and an unreadable fixture is one
+    nobody will keep accurate."""
+    rules, injections = [], []
+    for path in paths:
+        base_dir = os.path.dirname(os.path.abspath(path))
+        buffered, start_line, last_error = "", 0, None
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = list(enumerate(fh, 1))
+        for lineno, line in lines:
+            stripped = line.strip()
+            if not buffered and (
+                not stripped or stripped.startswith("#") or stripped.startswith("//")
+            ):
+                continue
+            if not buffered:
+                start_line = lineno
+            buffered = (buffered + " " + stripped).strip()
+            try:
+                obj = json.loads(buffered)
+            except ValueError as err:
+                last_error = err
+                continue
+            buffered, last_error = "", None
+            obj = _expand_files(obj, base_dir)
+            obj["__source__"] = "%s:%d" % (os.path.basename(path), start_line)
+            if "inject" in obj:
+                injections.append(obj)
+            elif "on" in obj or "on_input" in obj:
+                obj.setdefault("__matched__", 0)
+                rules.append(obj)
+            else:
+                raise ScriptError(
+                    "%s:%d: object has none of `on', `on_input' or `inject'"
+                    % (path, start_line)
+                )
+        if buffered:
+            raise ScriptError("%s:%d: unterminated JSON object: %s"
+                              % (path, start_line, last_error))
+    return rules, injections
+
+
+def _value_matches(pattern, actual):
+    if isinstance(pattern, str) and len(pattern) >= 2 and pattern.startswith("~") and pattern.endswith("~"):
+        return re.search(pattern[1:-1], "" if actual is None else str(actual)) is not None
+    return pattern == actual
+
+
+# ---------------------------------------------------------------------
+# replay
+
+class Bridge:
+    def __init__(self, args, rules, injections, writer):
+        self.args = args
+        self.rules = rules
+        self.injections = injections
+        self.out = writer
+        self.started = time.time()
+        self._timers = []
+        self._handlers = []
+
+    # -- rule selection ------------------------------------------------
+
+    def match(self, request):
+        method = request.get(self.args.method_key)
+        params = request.get(self.args.params_key) or {}
+        for rule in self.rules:
+            if "on" not in rule:
+                continue
+            times = rule.get("times")
+            if times is not None and rule["__matched__"] >= times:
+                continue
+            on = rule["on"]
+            ok = True
+            for key, pattern in on.items():
+                actual = method if key == self.args.method_key else params.get(key)
+                if not _value_matches(pattern, actual):
+                    ok = False
+                    break
+            if ok:
+                rule["__matched__"] += 1
+                return rule
+        return None
+
+    def match_inbound(self, line):
+        """Select an `on_input' rule for a non-request line the client sent.
+
+        A protocol that can ask its client a question -- a prompt, a
+        credential, a confirmation -- gets the answer back on stdin with
+        no method of its own, correlated only by id.  Without this the
+        fake could pose the question but never react to the answer, so
+        the interesting half of that exchange (does what the client
+        typed actually reach the backend?) would be untestable."""
+        for rule in self.rules:
+            if "on_input" not in rule:
+                continue
+            times = rule.get("times")
+            if times is not None and rule["__matched__"] >= times:
+                continue
+            if all(_value_matches(pattern, line.get(key))
+                   for key, pattern in rule["on_input"].items()):
+                rule["__matched__"] += 1
+                return rule
+        return None
+
+    # -- emitting ------------------------------------------------------
+
+    def _emit(self, item, request_id):
+        """Write one out-of-band payload.  Returns the output payload it
+        wrote, or None -- the caller collects those for
+        <repeat-all-emitted>."""
+        item = {k: v for k, v in item.items() if k != "after_ms"}
+        if "output" in item:
+            payload = item["output"]
+            line = {self.args.id_key: request_id, "output": payload}
+            line.update({k: v for k, v in item.items() if k != "output"})
+            self.out.line(line)
+            return payload
+        if "input_request" in item:
+            line = {self.args.id_key: request_id, "input_request": item["input_request"]}
+            self.out.line(line)
+            return None
+        if "event" in item:
+            self.out.line(item)
+            return None
+        if "raw" in item:
+            self.out.raw(item["raw"])
+            return None
+        self.out.log("!! emit item has none of output/event/input_request/raw: %r" % (item,))
+        return None
+
+    def schedule(self, item, request_id, collected):
+        """Emit ITEM after its `after_ms'.  Returns the timer, or None if
+        it fired inline."""
+        delay = item.get("after_ms", 0) / 1000.0
+
+        def fire():
+            payload = self._emit(item, request_id)
+            if payload is not None:
+                collected.append(payload)
+
+        if delay <= 0:
+            fire()
+            return None
+        timer = threading.Timer(delay, fire)
+        timer.daemon = True
+        timer.start()
+        self._timers.append(timer)
+        return timer
+
+    def start_injections(self):
+        for injection in self.injections:
+            at = injection.get("at", "t+0")
+            match = re.match(r"t\+(\d+)", str(at))
+            delay = int(match.group(1)) / 1000.0 if match else 0.0
+            item = injection["inject"]
+            timer = threading.Timer(delay, lambda i=item: self._emit(i, None))
+            timer.daemon = True
+            timer.start()
+            self._timers.append(timer)
+
+    # -- the reply -----------------------------------------------------
+
+    @staticmethod
+    def _expand_repeats(value, collected):
+        if value == "<repeat-all-emitted>":
+            return list(collected)
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                if item == "<repeat-all-emitted>":
+                    out.extend(collected)
+                else:
+                    out.append(Bridge._expand_repeats(item, collected))
+            return out
+        if isinstance(value, dict):
+            return {k: Bridge._expand_repeats(v, collected) for k, v in value.items()}
+        return value
+
+    def handle(self, request, rule="<match>"):
+        request_id = request.get(self.args.id_key)
+        if rule == "<match>":
+            rule = self.match(request)
+
+        if rule is None:
+            self.out.log("?? no rule for %r" % (request,))
+            if self.args.unmatched == "never":
+                return
+            if self.args.unmatched == "empty":
+                self.out.reply({self.args.id_key: request_id, "result": {}})
+                return
+            self.out.reply(
+                {
+                    self.args.id_key: request_id,
+                    "error": {
+                        "message": "eh-fake-bridge: no rule matched method %r"
+                        % (request.get(self.args.method_key),),
+                        "status": 501,
+                    },
+                }
+            )
+            return
+
+        collected = []
+        scheduled = []
+        for item in rule.get("emit", []):
+            timer = self.schedule(item, request_id, collected)
+            if timer is not None:
+                scheduled.append(timer)
+
+        if rule.get("never_reply") or (
+            "on_input" in rule and "reply" not in rule and "error" not in rule
+        ):
+            # An `on_input' rule that only emits has already said
+            # everything it had to say: the client's answer completes no
+            # request of its own, and inventing a reply for it would put
+            # a line on the wire no real backend would send.
+            for timer in scheduled:
+                timer.join()
+            self.out.log("-- %s: emitted, no reply" % rule["__source__"])
+            return
+
+        # Join the emit timers rather than sleeping for the same span.
+        # Sleeping is a race the reply loses roughly half the time when
+        # the last emit is scheduled at exactly the sleep duration: the
+        # reply goes out first, and `<repeat-all-emitted>' expands to a
+        # chunk short.  A fixture that reproduces intermittently is worse
+        # than no fixture, so wait on the actual event.
+        for timer in scheduled:
+            timer.join()
+        delay = rule.get("delay_ms", 0) / 1000.0
+        if delay > 0:
+            time.sleep(delay)
+
+        fault = rule.get("fault")
+        if fault is None and self.args.fault and self.out.replies_written() == 0:
+            fault = self.args.fault
+        if fault == "stderr-noise":
+            fault = None
+
+        if "error" in rule:
+            self.out.reply({self.args.id_key: request_id, "error": rule["error"]}, fault)
+        else:
+            result = self._expand_repeats(rule.get("reply", {}), collected)
+            self.out.reply({self.args.id_key: request_id, "result": result}, fault)
+
+    # -- the loop ------------------------------------------------------
+
+    def run(self):
+        self.start_injections()
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            self.out.log("<- %s" % line)
+            try:
+                request = json.loads(line)
+            except ValueError:
+                # Not every first line is a request: a package may send a
+                # secret or a handshake on stdin before the protocol
+                # starts (jsonyter's `stdin' token transport does exactly
+                # that).  Swallowing it is what makes the fake usable
+                # with those transports unchanged.
+                self.out.log("?? non-JSON stdin line ignored")
+                continue
+            if not isinstance(request, dict):
+                continue
+            # A reply to an input_request we emitted is inbound traffic,
+            # not a new request; it carries no method.
+            if self.args.method_key not in request:
+                rule = self.match_inbound(request)
+                if rule is None:
+                    self.out.log("-- inbound non-request, no on_input rule; ignored")
+                    continue
+                handler = threading.Thread(
+                    target=self.handle, args=(request, rule), daemon=True)
+                self._handlers.append(handler)
+                handler.start()
+                continue
+            handler = threading.Thread(target=self.handle, args=(request,), daemon=True)
+            self._handlers.append(handler)
+            handler.start()
+        self.linger()
+
+    def linger(self):
+        """Finish scheduled work after stdin closes.
+
+        A package that has gone away closes the pipe, and the real
+        backend would then exit -- but so would we, mid-emit, before a
+        scripted 200ms stream chunk had fired.  Under `eh run' that is
+        invisible; piping a fixture in from a shell to check what it
+        does, it looks exactly like a broken script.  Wait out the
+        outstanding timers instead, up to --linger-ms."""
+        deadline = time.time() + self.args.linger_ms / 1000.0
+        for worker in list(self._handlers) + list(self._timers):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+
+
+def stderr_noise():
+    """Chatter on stderr forever.  A backend whose stderr is noisy is the
+    normal case, not the exotic one -- Python import warnings alone are
+    enough -- and a package that lets that noise reach its protocol
+    parser is broken in a way only this can prove."""
+    n = 0
+    while True:
+        n += 1
+        sys.stderr.write(
+            "eh-fake-bridge: warning %d: this line must never be parsed as protocol\n" % n
+        )
+        sys.stderr.flush()
+        time.sleep(0.2)
+
+
+# ---------------------------------------------------------------------
+# record mode
+
+def record(out_path, command, args):
+    """Proxy stdin/stdout to a real backend, writing a replayable script."""
+    import subprocess
+
+    spill_dir = out_path + ".d"
+    os.makedirs(spill_dir, exist_ok=True)
+    child = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+    )
+    script = open(out_path, "w", encoding="utf-8")
+    lock = threading.Lock()
+    pending = {}          # request id -> {"request":…, "t0":…, "emits":[…]}
+    order = []
+
+    def spill(value):
+        """Replace any long base64-looking string with a {"$file": …} ref."""
+        if isinstance(value, str) and len(value) > 512:
+            blob = value.encode("utf-8")
+            name = hashlib.sha256(blob).hexdigest()[:16] + ".bin"
+            path = os.path.join(spill_dir, name)
+            if not os.path.exists(path):
+                with open(path, "wb") as fh:
+                    fh.write(blob)
+            return {"$file": os.path.join(os.path.basename(spill_dir), name)}
+        if isinstance(value, dict):
+            return {k: spill(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [spill(v) for v in value]
+        return value
+
+    def write_rule(entry):
+        request = entry["request"]
+        params = request.get(args.params_key) or {}
+        on = {args.method_key: request.get(args.method_key)}
+        for key in ("code", "name"):
+            if key in params:
+                on[key] = params[key]
+        rule = {"on": on}
+        if entry["emits"]:
+            rule["emit"] = entry["emits"]
+        if "error" in entry.get("reply", {}):
+            rule["error"] = spill(entry["reply"]["error"])
+        else:
+            rule["reply"] = spill(entry.get("reply", {}).get("result", {}))
+        script.write(json.dumps(rule, separators=(",", ":")) + "\n")
+        script.flush()
+
+    def pump_out():
+        for raw in child.stdout:
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+            try:
+                message = json.loads(raw.decode("utf-8").strip())
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(message, dict):
+                continue
+            with lock:
+                mid = message.get(args.id_key)
+                entry = pending.get(mid)
+                if entry is None:
+                    if "event" in message:
+                        script.write(
+                            json.dumps(
+                                {"at": "t+%d" % int((time.time() - t_start) * 1000),
+                                 "inject": spill({k: v for k, v in message.items()
+                                                  if k != args.id_key})},
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
+                        script.flush()
+                    continue
+                after_ms = int((time.time() - entry["t0"]) * 1000)
+                if "output" in message:
+                    entry["emits"].append({"after_ms": after_ms,
+                                           "output": spill(message["output"])})
+                elif "input_request" in message:
+                    entry["emits"].append({"after_ms": after_ms,
+                                           "input_request": spill(message["input_request"])})
+                else:
+                    entry["reply"] = message
+                    write_rule(entry)
+                    pending.pop(mid, None)
+                    if mid in order:
+                        order.remove(mid)
+
+    t_start = time.time()
+    reader = threading.Thread(target=pump_out, daemon=True)
+    reader.start()
+
+    for raw in sys.stdin.buffer:
+        child.stdin.write(raw)
+        child.stdin.flush()
+        try:
+            request = json.loads(raw.decode("utf-8").strip())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(request, dict) and args.method_key in request:
+            with lock:
+                mid = request.get(args.id_key)
+                pending[mid] = {"request": request, "t0": time.time(), "emits": []}
+                order.append(mid)
+
+    child.stdin.close()
+    child.wait()
+    script.close()
+    return child.returncode
+
+
+# ---------------------------------------------------------------------
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--script", action="append", default=[])
+    parser.add_argument("--fault", default=None)
+    parser.add_argument("--log", default=None)
+    parser.add_argument("--record", default=None)
+    parser.add_argument("--id-key", default="id")
+    parser.add_argument("--method-key", default="method")
+    parser.add_argument("--params-key", default="params")
+    parser.add_argument("--unmatched", default="error",
+                        choices=("error", "empty", "never"))
+    parser.add_argument("--linger-ms", type=int, default=2000)
+    parser.add_argument("--help", action="store_true")
+    # Everything the package under test appends for its real backend
+    # (--url, --token, --insecure, ...) lands here and is discarded.
+    args, ignored = parser.parse_known_args(argv)
+
+    if args.help:
+        sys.stdout.write(__doc__)
+        return 0
+
+    log = open(args.log, "a", encoding="utf-8") if args.log else None
+    if log:
+        log.write("=== eh-fake-bridge %s (ignored: %s)\n" % (argv, ignored))
+        log.flush()
+
+    if args.record is not None:
+        if "--" not in ignored:
+            sys.stderr.write("eh-fake-bridge: --record needs `-- REAL-COMMAND ...'\n")
+            return 2
+        command = ignored[ignored.index("--") + 1 :]
+        if not command:
+            sys.stderr.write("eh-fake-bridge: --record needs a command after `--'\n")
+            return 2
+        return record(args.record, command, args)
+
+    if not args.script:
+        sys.stderr.write("eh-fake-bridge: nothing to do -- pass --script FILE.jsonl\n")
+        return 2
+
+    try:
+        rules, injections = load_scripts(args.script)
+    except (ScriptError, OSError) as err:
+        sys.stderr.write("eh-fake-bridge: %s\n" % err)
+        return 2
+
+    if args.fault == "stderr-noise":
+        threading.Thread(target=stderr_noise, daemon=True).start()
+
+    writer = Writer(sys.stdout, log)
+    try:
+        Bridge(args, rules, injections, writer).run()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -11,12 +11,34 @@
 
 (defvar eh-profile-name nil)
 (defvar eh-profile-fixtures-dir nil)
+(defvar eh-profile-bridge-scripts-dir nil
+  "Directory holding this profile's `eh-fake-bridge' scripts (DESIGN 9.2).
+A profile whose package talks to a backend process points that package's
+own \"how do I launch my backend\" option at `eh-fake-bridge-command',
+which resolves a script name against this directory.")
+
 (defvar eh-profile-scratch-dir nil
   "Session scratch HOME; fixtures are copied here before a scenario touches them.
 Never write into the read-only package/profile source trees (DESIGN §5.3).")
 (defvar eh-available-kernels nil
   "List of kernel name strings (e.g. \"python3\") reachable this session.
 Used by `:needs (:kernel ...)' to decide skip vs run.")
+
+(defvar eh-scenario-setup-functions nil
+  "Functions run with no arguments before every scenario body.
+
+The place a profile puts \"put my package back the way a fresh session
+found it\".  A profile's own globals -- which backend a package is
+pointed at, a mode a scenario turned on -- are not buffers, so the
+buffer teardown below does not touch them, and a scenario that changed
+one silently changes every scenario that runs after it.  That is the
+single most common source of \"passes alone, fails in the suite\"
+(DESIGN 5.2), and it is invisible: the leak shows up as an unrelated
+scenario failing for a reason that makes no sense where it is.")
+
+(defvar eh-profile-log-buffers nil
+  "Buffer names a profile declared worth sweeping into a failure bundle.
+Set by `eh-defprofile'; declared here too so this file compiles alone.")
 
 (defvar eh-current-scenario-name nil)
 (defvar eh-artifacts-root nil
@@ -59,6 +81,14 @@ Used by `:needs (:kernel ...)' to decide skip vs run.")
                 (:kernel (unless (member val eh-available-kernels)
                            (cl-return (format "needs kernel %s (available: %s)"
                                               val eh-available-kernels))))
+                ;; A package's real backend, where the profile keeps a
+                ;; tier of scenarios against it alongside the fake
+                ;; (DESIGN 9.1/9.2).  The fake cannot answer everything:
+                ;; anything whose result is a *file the backend wrote*
+                ;; needs the real one, and skipping legibly where it is
+                ;; not installed is what keeps that tier optional.
+                (:executable (unless (executable-find val)
+                               (cl-return (format "needs %s on PATH" val))))
                 (:graphic (unless (display-graphic-p)
                             (cl-return "needs a graphical frame"))))
            finally (cl-return nil)))
@@ -75,6 +105,38 @@ and find-file it there.  Never opens the read-only profile copy."
     (make-directory (file-name-directory dst) t)
     (copy-file src dst t)
     (find-file dst)))
+
+;;; ---------------------------------------------------------------------
+;;; the scriptable fake backend (DESIGN 9.2)
+
+(defvar eh-fake-bridge "/opt/eh/bin/eh-fake-bridge"
+  "Path to the scriptable stand-in for a package's backend process.")
+
+(defun eh-fake-bridge-command (&rest args)
+  "Command list running `eh-fake-bridge' with ARGS.
+A string ending in `.jsonl' names a script in the profile's
+`bridge-scripts/' directory and expands to `--script <abspath>';
+everything else is passed through untouched, so faults and key overrides
+read as themselves:
+
+  (eh-fake-bridge-command \"base.jsonl\" \"python.jsonl\" \"--fault\" \"slow-drip\")
+
+The result is what a profile assigns to the package's own \"how do I
+launch my backend\" option, which is the whole point: the package
+launches its backend exactly as it always does, and never learns that
+the thing on the other end of the pipe is a fixture."
+  (cons eh-fake-bridge
+        (mapcan (lambda (arg)
+                  ;; Keyed off the extension, not off "does not start with
+                  ;; a dash": the latter swallows a flag's *argument*
+                  ;; ("--fault" "stderr-noise") as a script name, and the
+                  ;; bridge then dies on a missing file with the fault
+                  ;; silently never applied.
+                  (if (and (stringp arg) (string-suffix-p ".jsonl" arg))
+                      (list "--script"
+                            (expand-file-name arg eh-profile-bridge-scripts-dir))
+                    (list arg)))
+                args)))
 
 ;;; ---------------------------------------------------------------------
 ;;; the macro
@@ -110,6 +172,7 @@ and find-file it there.  Never opens the read-only profile copy."
            ;; only gets set on normal completion.
            (unwind-protect
                (progn
+                 (run-hooks 'eh-scenario-setup-functions)
                  ,(when geometry
                     `(eh-apply-determinism-settings ,(car geometry) ,(cdr geometry)))
                  ,(when fixture `(eh-open-fixture ,fixture))
@@ -162,6 +225,19 @@ the signal that caused the abnormal exit."
                                       (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" name))
                               dir)
               (insert (eh--prin1-to-string-unlimited snapshot)))))))
+    ;; A profile's declared log buffers, by name.  The sweep above skips
+    ;; every buffer whose name starts with a space, which is exactly
+    ;; where a package hides a subprocess's stderr -- and that is usually
+    ;; the one place a failure's actual reason is written down.  Nothing
+    ;; used `:log-buffers' before this, so declaring them did nothing.
+    (dolist (name eh-profile-log-buffers)
+      (let ((buffer (get-buffer name)))
+        (when (buffer-live-p buffer)
+          (with-temp-file (expand-file-name
+                            (format "log-%s.txt"
+                                    (replace-regexp-in-string "[^A-Za-z0-9.-]" "_" name))
+                            dir)
+            (insert-buffer-substring buffer)))))
     (when (display-graphic-p)
       (ignore-errors (eh-shot-to-file (expand-file-name "failure.png" dir))))))
 

@@ -83,6 +83,23 @@ jobs:
         if: always()
         run: |
           docker logs emacs-harness-http --tail 200 || true
+          # `bootstrap-server.sh` creates server mode's default session
+          # with `|| true', so a session that came up wrong leaves no
+          # trace in the container's own logs -- the reason is in this
+          # file and nowhere else. Without it, a failure in the steps
+          # above (a frame that never reached its requested geometry,
+          # say) is a number with no explanation behind it.
+          echo "--- /var/log/eh/bootstrap-session.log ---"
+          docker exec emacs-harness-http cat /var/log/eh/bootstrap-session.log || true
+          echo "--- session emacs.log ---"
+          # A session's run dir is EH_VAR_RUN/<name> (/run/eh/default), not
+          # EH_RUNS_ROOT/<name> -- EH_RUNS_ROOT (/var/lib/eh/runs) holds
+          # scenario *artifacts*, which is a different tree. Globbing both
+          # rather than naming one: a diagnostic that silently prints
+          # nothing is worse than no diagnostic, because it reads like
+          # evidence of nothing being wrong.
+          docker exec emacs-harness-http sh -c \
+            'tail -n 100 /run/eh/*/emacs.log /var/lib/eh/runs/*/emacs.log 2>/dev/null' || true
           docker rm -f emacs-harness-http || true
 
       - name: Upload run artifacts

@@ -117,9 +117,14 @@ emacs-harness/
 ├── docs/example-scenarios.md  ← a fully worked, fictional-package scenario
 │                                 catalogue illustrating the categories of
 │                                 behaviour a real profile would target
+├── docs/profiles-for-your-package.md
+│                              ← how to add your own package: profile layout,
+│                                 out-of-tree profiles, eh-fake-bridge, CI
 ├── .github/workflows/ci.yml   ← builds the image, runs the smoke profile
 │                                 and the HTTP/MCP acceptance test headlessly
 ├── bin/eh                     ← thin client (runs wherever the agent runs)
+├── bin/eh-fake-bridge         ← scriptable stand-in for a package's backend
+│                                 process (DESIGN §9.2); package-agnostic
 ├── container/                 ← Dockerfile, supervisord, entrypoint
 ├── compose.yaml                ← local-dev wrapper around the one image
 ├── ehd/                       ← in-container dispatcher (ehd.py) + bridge (ehd_cli.py)
@@ -129,9 +134,11 @@ emacs-harness/
 │                                 HTTP API (DESIGN §14 phase 4); test_acceptance.py is
 │                                 phase 4's own acceptance test, frozen and run in CI
 ├── profiles/
-│   └── smoke/                 ← trivial profile that proves the core is generic
-│       (no other profiles exist yet -- add one for whatever package you
-│        want to test, see DESIGN.md §8.4)
+│   └── smoke/                 ← trivial profile that proves the core is generic,
+│                                 and eh-fake-bridge's own coverage
+│       (no other profiles live here -- a profile for a real package belongs
+│        in that package's own repository, mounted in; see
+│        docs/profiles-for-your-package.md and DESIGN.md §8.4)
 └── runs/                      ← per-run artifacts (gitignored)
 ```
 
@@ -402,9 +409,18 @@ under `profiles/<name>/scenarios/` so it can never come back silently.
 `docs/example-scenarios.md` is a longer, fully worked catalogue against a
 fictional package covering the categories DESIGN §1 calls out (sliced
 images, output overlays, streaming redraws, mode-line state, scroll
-discipline). Adding a package to the harness is adding a
-`profiles/<name>/` directory (`profile.el`, `init.el`, `fixtures/`,
-`scenarios/*.el` — see DESIGN §8.4) — never editing the core.
+discipline). Adding a package to the harness is adding a profile
+directory (`profile.el`, `init.el`, `fixtures/`, `scenarios/*.el` — see
+DESIGN §8.4) — never editing the core.
+
+**[`docs/profiles-for-your-package.md`](docs/profiles-for-your-package.md)
+is the practical guide to doing that**, and covers the two things this
+section skips: keeping the profile in the *package's* repository and
+mounting it in, so scenarios change in the same pull request as the code
+they test; and `bin/eh-fake-bridge`, the scriptable stand-in for a
+package's backend process (DESIGN §9.2) that makes a wedged request, a
+truncated reply, or a kernel dying mid-run something a scenario can ask
+for by name.
 
 ### From Claude Code, via MCP
 
