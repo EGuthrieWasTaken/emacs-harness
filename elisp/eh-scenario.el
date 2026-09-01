@@ -65,6 +65,14 @@ Used by `:needs (:kernel ...)' to decide skip vs run.")
                 (:kernel (unless (member val eh-available-kernels)
                            (cl-return (format "needs kernel %s (available: %s)"
                                               val eh-available-kernels))))
+                ;; A package's real backend, where the profile keeps a
+                ;; tier of scenarios against it alongside the fake
+                ;; (DESIGN 9.1/9.2).  The fake cannot answer everything:
+                ;; anything whose result is a *file the backend wrote*
+                ;; needs the real one, and skipping legibly where it is
+                ;; not installed is what keeps that tier optional.
+                (:executable (unless (executable-find val)
+                               (cl-return (format "needs %s on PATH" val))))
                 (:graphic (unless (display-graphic-p)
                             (cl-return "needs a graphical frame"))))
            finally (cl-return nil)))

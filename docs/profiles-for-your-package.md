@@ -90,9 +90,14 @@ backend isn't installed:
 
 ```elisp
 (eh-scenario mypkg/real-backend-round-trip
-  :needs (:kernel "python3")
+  :needs (:executable "mypkg-backend")
   ...)
 ```
+
+`:needs` understands `:emacs ">= 29.1"`, `:cairo t`, `:svg t`,
+`:graphic t`, `:kernel "python3"` and `:executable "NAME"`. Each one
+`ert-skip`s with a legible reason rather than failing, so a tier that
+is unavailable in one environment reports as skipped instead of red.
 
 ### The fake — `eh-fake-bridge`
 
