@@ -13,8 +13,11 @@ ehd does the work; `bin/eh` and `ehd-cli` are dumb pipes to it.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import dataclasses
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -37,6 +40,18 @@ SCRATCH_ROOT = Path(os.environ.get("EH_SCRATCH_ROOT", "/tmp"))
 SOCKET_PATH = Path(os.environ.get("EH_SOCK", str(RUN_ROOT / "eh.sock")))
 EMACS_BIN = os.environ.get("EH_EMACS_BIN", "emacs")
 DISPLAY_BASE = int(os.environ.get("EH_DISPLAY_BASE", "99"))
+
+# DESIGN §6.1/§14 phase 4: the HTTP transport, off by default. The real
+# access boundary is the Cloudflare Tunnel + Access application in front
+# of it (§10.2); CF-Access-Client-Id/Secret matching here is defense in
+# depth for whatever reaches this process directly, not the only gate.
+HTTP_ENABLE = os.environ.get("EH_HTTP_ENABLE", "0") not in ("", "0", "false", "False")
+HTTP_HOST = os.environ.get("EH_HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("EH_HTTP_PORT", "8080"))
+HTTP_CLIENT_ID = os.environ.get("EH_HTTP_CLIENT_ID", "")
+HTTP_CLIENT_SECRET = os.environ.get("EH_HTTP_CLIENT_SECRET", "")
+HTTP_MAX_BODY = 8 * 1024 * 1024
+HTTP_INLINE_SHOT_CAP = 8 * 1024 * 1024
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -680,7 +695,10 @@ async def _resolve_click_xy(sess: Session, args: dict, timeout: float) -> tuple[
         x, y = args["xy"]
         return int(x), int(y)
     if args.get("at_point"):
-        form = "(eh-display-xy-json (point))"
+        # Not a bare `(point)`: `current-buffer` at RPC time is server.el's
+        # own connection buffer, not whatever an earlier, separate `eh`
+        # call left on screen (see `eh-selected-buffer` in eh-driver.el).
+        form = "(eh-display-xy-json (eh-selected-point))"
     elif args.get("at"):
         form = f'(eh-display-xy-json {args["at"]})'
     elif args.get("at_text"):
@@ -850,6 +868,146 @@ def _junit_xml(profile: str, summary: dict) -> str:
 
 
 # ---------------------------------------------------------------------
+# HTTP transport (DESIGN §6.1, §14 phase 4)
+#
+# A shim over the same `handle()` dispatcher the Unix socket uses --
+# not a second implementation. `POST /v1/<cmd>` takes the same
+# {session, args, timeout} body `ehd-cli` takes on stdin, cmd moves into
+# the URL path instead of the JSON body. `GET /health` is unauthenticated,
+# for the tunnel/orchestrator's own liveness checks.
+
+def _http_status_line(code: int) -> str:
+    reasons = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
+               405: "Method Not Allowed", 413: "Payload Too Large",
+               500: "Internal Server Error"}
+    return f"HTTP/1.1 {code} {reasons.get(code, 'Error')}"
+
+
+async def _http_write_json(writer: asyncio.StreamWriter, code: int, obj: dict) -> None:
+    body = json.dumps(obj).encode()
+    header = (f"{_http_status_line(code)}\r\n"
+              f"Content-Type: application/json\r\n"
+              f"Content-Length: {len(body)}\r\n"
+              f"Connection: close\r\n\r\n").encode()
+    writer.write(header + body)
+    await writer.drain()
+
+
+async def _http_read_request(reader: asyncio.StreamReader):
+    """Minimal HTTP/1.1 request parser: request line + headers + a
+    Content-Length body. No chunked transfer-encoding, no keep-alive --
+    this serves single JSON request/response round trips from `bin/eh`
+    and the MCP shim (DESIGN §6.1's http transport is a machine path,
+    same as ssh/docker), not a browser."""
+    request_line = await reader.readline()
+    if not request_line:
+        return None
+    try:
+        method, path, _version = request_line.decode(errors="replace").strip().split(" ", 2)
+    except ValueError:
+        return None
+    headers: dict[str, str] = {}
+    while True:
+        line = await reader.readline()
+        if not line or line in (b"\r\n", b"\n"):
+            break
+        if b":" not in line:
+            continue
+        k, v = line.decode(errors="replace").split(":", 1)
+        headers[k.strip().lower()] = v.strip()
+    length = int(headers.get("content-length", "0") or "0")
+    if length > HTTP_MAX_BODY:
+        return method, path, headers, None
+    body = await reader.readexactly(length) if length else b""
+    return method, path, headers, body
+
+
+def _http_check_auth(headers: dict) -> bool:
+    if not HTTP_CLIENT_ID and not HTTP_CLIENT_SECRET:
+        return True
+    got_id = headers.get("cf-access-client-id", "")
+    got_secret = headers.get("cf-access-client-secret", "")
+    return (hmac.compare_digest(got_id, HTTP_CLIENT_ID)
+            and hmac.compare_digest(got_secret, HTTP_CLIENT_SECRET))
+
+
+async def _inline_shot_bytes(resp: dict) -> None:
+    """The HTTP caller -- the MCP shim, most notably -- has no shared
+    filesystem with the container, unlike the CLI's local/docker/ssh
+    transports, which can `Read` `resp["path"]` themselves. Inline the
+    PNG so one HTTP round trip is enough for `emacs_screenshot` to hand
+    back real pixels (DESIGN §14's "no Bash calls" acceptance test)."""
+    try:
+        data = Path(resp["path"]).read_bytes()
+    except OSError:
+        return
+    if len(data) <= HTTP_INLINE_SHOT_CAP:
+        resp["data_base64"] = base64.b64encode(data).decode("ascii")
+
+
+async def handle_http_connection(mgr: SessionManager, reader: asyncio.StreamReader,
+                                  writer: asyncio.StreamWriter) -> None:
+    try:
+        try:
+            parsed = await asyncio.wait_for(_http_read_request(reader), timeout=30)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+            return
+        if parsed is None:
+            return
+        method, path, headers, body = parsed
+        if body is None:
+            await _http_write_json(writer, 413,
+                                    {"ok": False, "error": {"message": "request body too large"},
+                                     "exit_code": EXIT_USAGE})
+            return
+
+        if method == "GET" and path.split("?", 1)[0] in ("/health", "/healthz"):
+            await _http_write_json(writer, 200, {"ok": True, "status": "healthy"})
+            return
+
+        route = path.split("?", 1)[0]
+        if not route.startswith("/v1/"):
+            await _http_write_json(writer, 404, {"ok": False, "error": {"message": "not found"},
+                                                  "exit_code": EXIT_USAGE})
+            return
+        if method != "POST":
+            await _http_write_json(writer, 405,
+                                    {"ok": False, "error": {"message": "method not allowed"},
+                                     "exit_code": EXIT_USAGE})
+            return
+        if not _http_check_auth(headers):
+            await _http_write_json(writer, 401, {"ok": False, "error": {"message": "unauthorized"},
+                                                  "exit_code": EXIT_USAGE})
+            return
+
+        cmd = route[len("/v1/"):].strip("/")
+        try:
+            payload = json.loads(body.decode()) if body else {}
+        except Exception:
+            await _http_write_json(writer, 400,
+                                    {"ok": False, "error": {"message": "invalid JSON body"},
+                                     "exit_code": EXIT_USAGE})
+            return
+        req = dict(cmd=cmd, session=payload.get("session"), args=payload.get("args") or {},
+                   timeout=payload.get("timeout") or 30)
+        try:
+            resp = await handle(mgr, req)
+        except EhError as e:
+            resp = dict(ok=False, error={"message": e.message, **e.extra}, exit_code=e.exit_code)
+        except EhEvalError as e:
+            resp = dict(ok=False, error=e.envelope.get("error"), exit_code=EXIT_EMACS_ERROR)
+        except Exception as e:  # noqa: BLE001
+            resp = dict(ok=False, error={"message": f"internal ehd error: {e}"}, exit_code=EXIT_USAGE)
+
+        if cmd == "shot" and resp.get("ok") and resp.get("path"):
+            await _inline_shot_bytes(resp)
+
+        await _http_write_json(writer, 200, resp)
+    finally:
+        writer.close()
+
+
+# ---------------------------------------------------------------------
 # server
 
 async def handle_connection(mgr: SessionManager, reader: asyncio.StreamReader,
@@ -878,12 +1036,24 @@ async def amain():
     if SOCKET_PATH.exists():
         SOCKET_PATH.unlink()
     mgr = SessionManager()
-    server = await asyncio.start_unix_server(
+    unix_server = await asyncio.start_unix_server(
         lambda r, w: handle_connection(mgr, r, w), path=str(SOCKET_PATH)
     )
     os.chmod(SOCKET_PATH, 0o666)
-    async with server:
-        await server.serve_forever()
+
+    async with contextlib.AsyncExitStack() as stack:
+        servers = [await stack.enter_async_context(unix_server)]
+        if HTTP_ENABLE:
+            if not (HTTP_CLIENT_ID and HTTP_CLIENT_SECRET):
+                sys.stderr.write(
+                    "ehd: WARNING -- EH_HTTP_ENABLE=1 with no EH_HTTP_CLIENT_ID/"
+                    "EH_HTTP_CLIENT_SECRET set; the HTTP API is unauthenticated "
+                    "at the origin (relying on Cloudflare Access in front of it)\n")
+            http_server = await asyncio.start_server(
+                lambda r, w: handle_http_connection(mgr, r, w), host=HTTP_HOST, port=HTTP_PORT)
+            servers.append(await stack.enter_async_context(http_server))
+            sys.stderr.write(f"ehd: HTTP API listening on {HTTP_HOST}:{HTTP_PORT}\n")
+        await asyncio.gather(*(s.serve_forever() for s in servers))
 
 
 if __name__ == "__main__":

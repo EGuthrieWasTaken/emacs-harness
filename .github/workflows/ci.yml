@@ -32,6 +32,59 @@ jobs:
       - name: eh run smoke
         run: docker run --rm --shm-size=1gb -v "$PWD/runs:/var/lib/eh/runs" emacs-harness:ci run smoke
 
+      - name: Start server mode with the HTTP API enabled
+        # DESIGN.md §14 phase 4: the HTTP transport (§6.1) that the MCP
+        # server (mcp-server/) is a shim over. `server` mode also brings
+        # up one default session (container/bootstrap-server.sh), which
+        # the steps below drive directly -- no `eh session new` needed.
+        run: |
+          mkdir -p runs
+          docker run -d --name emacs-harness-http --shm-size=1gb \
+            -e EH_HTTP_ENABLE=1 -e EH_HTTP_CLIENT_ID=ci-test-id -e EH_HTTP_CLIENT_SECRET=ci-test-secret \
+            -p 8080:8080 -v "$PWD/runs:/var/lib/eh/runs" \
+            emacs-harness:ci server
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:8080/health
+          # `entrypoint.sh` exports EH_TRANSPORT=local only within its own
+          # shell (server mode's supervisord process tree); a separate
+          # `docker exec` does not inherit that, so set it explicitly here.
+          for i in $(seq 1 60); do
+            docker exec -e EH_TRANSPORT=local emacs-harness-http eh session list | grep -q '"name": "default"' && break
+            sleep 2
+          done
+          docker exec -e EH_TRANSPORT=local emacs-harness-http eh session list
+
+      - name: HTTP API smoke test (auth enforcement + doctor + eval)
+        env:
+          EH_TRANSPORT: http
+          EH_HOST: http://localhost:8080
+          EH_CF_ACCESS_CLIENT_ID: ci-test-id
+          EH_CF_ACCESS_CLIENT_SECRET: ci-test-secret
+        run: |
+          # an unauthenticated request must be rejected, not silently served
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/v1/doctor -d '{}')
+          test "$code" = "401" || { echo "expected 401 for unauthenticated request, got $code"; exit 1; }
+          ./bin/eh --session default --json doctor
+          ./bin/eh --session default eval '(+ 40 2)'
+
+      - name: MCP server acceptance test (DESIGN §14 phase 4)
+        env:
+          EH_HOST: http://localhost:8080
+          EH_CF_ACCESS_CLIENT_ID: ci-test-id
+          EH_CF_ACCESS_CLIENT_SECRET: ci-test-secret
+        run: |
+          pip install -r mcp-server/requirements.txt
+          python3 mcp-server/test_acceptance.py --session default
+
+      - name: Stop HTTP server container
+        if: always()
+        run: |
+          docker logs emacs-harness-http --tail 200 || true
+          docker rm -f emacs-harness-http || true
+
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4

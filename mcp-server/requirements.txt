@@ -1,0 +1,5 @@
+# DESIGN.md §14 phase 4. Targets the mcp>=2.0 API (MCPServer); mcp 1.x
+# used a differently-shaped FastMCP class under mcp.server.fastmcp -- see
+# https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserver
+# if you need to run against an older pin.
+mcp>=2.0.0

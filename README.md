@@ -44,8 +44,29 @@ can't be run end-to-end until one exists), pinned multi-version Emacs
 distinctly-named binaries, but this environment — like every environment
 this harness has been driven in so far — has exactly one real Emacs release
 installed, so *different Emacs versions actually disagreeing on something*
-remains unexercised; see DESIGN §13.3 open question 1), and the MCP server
-(Phase 4).
+remains unexercised; see DESIGN §13.3 open question 1).
+
+**Phase 4 (the MCP server) is now implemented and proven end-to-end**: the
+HTTP transport in `ehd.py` (`POST /v1/<cmd>`, DESIGN §6.1 — a shim over the
+exact same `handle()` dispatcher the Unix socket uses, not a second
+implementation), the `http` branch of `bin/eh`'s transport dispatch, and
+`mcp-server/eh_mcp_server.py`, an MCP server exposing the eight tools DESIGN
+§14 names (`emacs_eval`, `emacs_snapshot`, `emacs_keys`, `emacs_click`,
+`emacs_screenshot`, `emacs_wait`, `emacs_run_scenario`, `emacs_session`),
+each a thin translation of one MCP tool call into one HTTP round trip to
+`ehd`. Auth is `CF-Access-Client-Id`/`CF-Access-Client-Secret` header
+matching against `EH_HTTP_CLIENT_ID`/`EH_HTTP_CLIENT_SECRET`, defense in
+depth for whatever reaches the origin directly — the real access boundary,
+per DESIGN §10.2, is the Cloudflare Tunnel + Access application in front of
+it. **Phase 4's own acceptance test** — "Claude Code with the MCP server
+configured can, in one session and with no Bash calls, open a fixture
+notebook, run a cell, wait for idle, and report the resolved face of the
+output border" — is proven directly in `mcp-server/test_acceptance.py`
+(committed, and run in CI): it drives `eh_mcp_server.py` exactly as a real
+MCP client would, over real stdio JSON-RPC via the official `mcp` SDK's own
+`ClientSession`, against `smoke`'s `hello.txt` fixture and marker-facing key
+binding standing in for the fictional notebook/cell/output-border example,
+the same substitution every other acceptance test in this repo makes.
 
 Diff-shot's pixel comparison (ImageMagick `compare`/`identify`, plus mask
 rectangles applied via `convert -draw`) is implemented once, in Elisp
@@ -252,10 +273,95 @@ access — it should already be all green.
     `eh-expect-no-visual-drift` itself `ert-skip`s (not fails, not silently
     passes) for a name that will never have an accepted baseline — the
     ordinary case for a freshly-run profile.
-- What's *still not* validated here: `docker build` itself (blocked by
-  egress policy, see above), `ffmpeg` video/gif capture, and the browser
-  view (x11vnc/websockify/noVNC) — none of those were exercised in this
-  pass.
+- **Phase 4's HTTP transport and MCP server were validated live**, the same
+  way (`ehd.py` run directly against a real display, not mocked), and doing
+  so surfaced three real, previously-latent bugs in the *core* eval bridge —
+  not new code this pass wrote, code every `eh` command has depended on
+  since phase 1, just never driven this way (one CLI invocation at a time,
+  the way an interactive agent actually uses it) until now:
+  - **`eh--eval-capturing` could not actually catch a Lisp error.** It used
+    a `debug-on-error`+custom-`debugger` substitution to turn a signalled
+    error into the JSON error envelope DESIGN §6.2 promises. That technique
+    silently does nothing here: `eh-driver-run` is invoked via `emacsclient
+    --eval`, which server.el evaluates inside its own blanket
+    `condition-case` (`(t (server-return-error proc err))`), and Emacs
+    resolves a signal to the *nearest enclosing `condition-case`* before
+    ever consulting `debug-on-error`/`debugger` — so server.el's own handler
+    always won first. Concretely, `eh eval '(error "boom")'` used to kill
+    the whole session (`emacsclient` exits nonzero, `ehd.py` marks the
+    session dead) instead of returning `{"ok": false, "error": {...}}`.
+    This is exactly the defect already found and fixed for
+    `eh-run-scenarios-json` (see the phase 1-3 entry above) — just never
+    applied to the bridge every other `eh` command goes through. Fixed by
+    switching `eh--eval-capturing` to a plain `condition-case` (which *does*
+    resolve correctly here, per the same reasoning), using
+    `signal-hook-function` — which still runs at the point of the signal,
+    before the stack unwinds — to keep capturing a real backtrace without
+    reintroducing the `debug-on-error` problem. That fix had its own bug on
+    the first attempt: the naive `signal-hook-function` handler recurses
+    into itself (`backtrace`/`with-output-to-string` can themselves signal)
+    and blows the C stack, hanging the whole session at 100% CPU — caught
+    live, fixed by rebinding `signal-hook-function` to nil for the handler's
+    own extent.
+  - **Named waiters (`eh wait NAME`) never matched.** `ehd.py` sends the
+    waiter name as an Elisp *string* (the file-based eval protocol has no
+    way to send a bare symbol); `eh-register-waiter` keys `eh-waiters` by
+    *symbols*. `assoc` on a string against symbol keys never matches, so
+    every named-waiter lookup failed with "no such waiter" — for every
+    profile, always, since day one; nothing had ever exercised this path
+    end-to-end before (the smoke scenarios use `eh-wait-for` with a lambda
+    directly, not the CLI's named-waiter string path). Fixed by interning
+    the name in `eh-wait-name` before the lookup.
+  - **`profiles/<name>/profile.el` — the declarative manifest that
+    registers named waiters, default snapshot props and log buffers — was
+    never actually loaded by any session.** `eh-profile.el`'s own header
+    comment says it "is loaded as part of `profiles/<name>/init.el`", but
+    `profiles/smoke/init.el` never did that load, and neither `ehd.py`'s
+    generated `session-init.el` nor anything else did it on the profile's
+    behalf. So every `eh-defprofile` declaration was dead code in every
+    real session — compounding the bug above, since even a correct
+    string→symbol lookup would still have found nothing registered. Fixed
+    by adding the missing `(load (expand-file-name "profile.el"
+    eh-profile-dir))` to `profiles/smoke/init.el`, per the convention
+    `eh-profile.el` already documented; any future profile needs the same
+    line.
+  - **A buffer-less `eh snapshot`/`eh click --at-point` silently operated
+    on the wrong buffer across separate `eh` invocations.** Both defaulted
+    to `(current-buffer)`/`(point)`, which is *not* stable across
+    `emacsclient --eval` calls the way it would be for one continuous
+    scenario body: server.el resets `current-buffer` to its own connection
+    buffer around every request, so a bare `(current-buffer)` evaluated in
+    one `eh` call never reflects what an *earlier*, separate `eh` call left
+    on screen — verified directly: right after `find-file` switches to a
+    fixture buffer, the very next, separate `eh eval` call reports
+    server.el's own connection buffer as current, even though the frame
+    still correctly shows the fixture. This meant the exact interactive,
+    one-command-at-a-time usage pattern the whole harness's agent contract
+    is built around silently broke the two conveniences DESIGN documents as
+    not requiring an explicit buffer. Fixed with a new `eh-selected-buffer`
+    (the selected window's buffer in the session's frame, not
+    `current-buffer`) and `eh-selected-point`, used by `eh-snapshot`'s
+    default and by `eh click --at-point`'s position resolution.
+  - All four were caught, root-caused and reverified using the exact
+    end-to-end flow phase 4's own acceptance test needs — open a fixture,
+    press a key, wait on a named waiter, snapshot with no `--buffer`,
+    resolve a click `--at-point` — over the real HTTP transport, then again
+    through the real MCP server via the official SDK's stdio client. None
+    of the four are HTTP- or MCP-specific; every one also affects the
+    ssh/docker/local transports and `bin/eh` used directly, just never
+    surfaced there because interactive, separate-invocation usage (as
+    opposed to one continuous scenario body) hadn't been exercised this
+    thoroughly before.
+- What's *still not* validated here: `docker build` itself — reproduced
+  again this pass (Docker Hub's CDN, `production.cloudfront.docker.com`,
+  still answers 403 through this sandbox's egress policy, on the very first
+  `FROM debian:bookworm-slim` layer, before reaching anything in this repo)
+  — `ffmpeg` video/gif capture, and the browser view
+  (x11vnc/websockify/noVNC). Also still unvalidated: the actual Cloudflare
+  Tunnel + Access path in front of the HTTP API (DESIGN §10.2) — the
+  `CF-Access-Client-Id`/`Secret` header check in `ehd.py` is proven, but
+  there is no Cloudflare account in this environment to prove the tunnel
+  itself terminates there correctly.
 
 The repository name and the `eh` command name are placeholders — rename
 freely, but rename consistently.
@@ -291,6 +397,10 @@ emacs-harness/
 ├── compose.yaml                ← local-dev wrapper around the one image
 ├── ehd/                       ← in-container dispatcher (ehd.py) + bridge (ehd_cli.py)
 ├── elisp/                     ← eh-driver.el, eh-scenario.el, eh-profile.el, eh-init-core.el
+├── mcp-server/                ← MCP server (eh_mcp_server.py): runs where Claude Code
+│                                 runs, not in the container -- a thin shim over ehd's
+│                                 HTTP API (DESIGN §14 phase 4); test_acceptance.py is
+│                                 phase 4's own acceptance test, frozen and run in CI
 ├── profiles/
 │   └── smoke/                 ← trivial profile that proves the core is generic
 │       (no other profiles exist yet -- add one for whatever package you
@@ -306,4 +416,49 @@ docker run --rm -it emacs-harness:dev doctor
 docker run -d --name emacs-harness -p 6080:6080 emacs-harness:dev server
 EH_TRANSPORT=docker EH_CONTAINER=emacs-harness bin/eh doctor
 EH_TRANSPORT=docker EH_CONTAINER=emacs-harness bin/eh run smoke
+```
+
+### The HTTP API and the MCP server (phase 4)
+
+Off by default. Enable it at `docker run` time, publish 8080 alongside
+6080, and set the same `CF-Access-Client-Id`/`Secret` pair on both sides —
+`ehd` checks them as defense in depth; the real access boundary is a
+Cloudflare Tunnel + Access application on its own hostname in front of
+8080, same pattern DESIGN §10.2 already uses for the noVNC view:
+
+```
+docker run -d --name emacs-harness -p 6080:6080 -p 8080:8080 \
+    -e EH_HTTP_ENABLE=1 -e EH_HTTP_CLIENT_ID=<id> -e EH_HTTP_CLIENT_SECRET=<secret> \
+    emacs-harness:dev server
+
+curl https://emacs-harness-api.example.com/health   # once the tunnel is up
+```
+
+Point `bin/eh` at it directly:
+
+```
+EH_TRANSPORT=http EH_HOST=https://emacs-harness-api.example.com \
+EH_CF_ACCESS_CLIENT_ID=<id> EH_CF_ACCESS_CLIENT_SECRET=<secret> \
+    bin/eh doctor
+```
+
+Or run the MCP server (`pip install -r mcp-server/requirements.txt`) and
+point Claude Code (or any MCP client) at it over stdio, with the same
+`EH_HOST`/`EH_CF_ACCESS_CLIENT_ID`/`EH_CF_ACCESS_CLIENT_SECRET` set in its
+environment:
+
+```json
+{
+  "mcpServers": {
+    "emacs-harness": {
+      "command": "python3",
+      "args": ["/path/to/emacs-harness/mcp-server/eh_mcp_server.py"],
+      "env": {
+        "EH_HOST": "https://emacs-harness-api.example.com",
+        "EH_CF_ACCESS_CLIENT_ID": "<id>",
+        "EH_CF_ACCESS_CLIENT_SECRET": "<secret>"
+      }
+    }
+  }
+}
 ```

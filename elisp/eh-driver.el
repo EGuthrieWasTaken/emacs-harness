@@ -203,19 +203,43 @@ Looked up by `eh wait NAME'.")
 (defvar eh--captured-backtrace nil)
 
 (defun eh--eval-capturing (form)
-  "Evaluate FORM.  Return (:ok VALUE) or (:error ERR :backtrace STRING)."
-  (let ((tag (make-symbol "eh-eval-done"))
-        (eh--captured-backtrace nil))
-    (catch tag
-      (let ((debug-on-error t)
-            (debug-on-quit t)
-            (debugger
-             (lambda (&rest args)
-               (setq eh--captured-backtrace (with-output-to-string (backtrace)))
-               (throw tag (list :error
-                                 (if (eq (car args) 'error) (cadr args) args)
-                                 :backtrace eh--captured-backtrace)))))
-        (throw tag (list :ok (eval form t)))))))
+  "Evaluate FORM.  Return (:ok VALUE) or (:error ERR :backtrace STRING).
+
+Deliberately a plain `condition-case', not a `debug-on-error'+`debugger'
+substitution (which is what this used before): `eh-driver-run' is invoked
+via `emacsclient --eval', which server.el evaluates inside its own
+blanket `condition-case' (`(t (server-return-error proc err))' in
+`server-process-filter'), and Emacs resolves a signal to the *nearest
+enclosing `condition-case'* before ever consulting `debug-on-error'/
+`debugger' -- so the handler installed by server.el always won first and
+ANY error signalled by FORM killed the whole `emacsclient' call (and, via
+the nonzero-exit-code path in `emacs_eval' in ehd.py, the whole session)
+instead of landing in the JSON envelope below, silently defeating the
+entire point of this file-based protocol (verified directly: evaluating
+a form that simply calls `error' used to kill the session rather than
+return a JSON envelope with ok false). This is exactly the defect
+`eh-run-scenarios-json' already documents and works around for `eh run';
+this is the same fix applied to the eval bridge every `eh' command goes
+through, not just that one.
+
+`signal-hook-function' still runs at the point of the signal, before the
+stack unwinds toward any handler, so it captures a real backtrace here
+without reintroducing the debug-on-error problem; it can fire more than
+once if FORM catches and re-signals internally, in which case the most
+recent (closest to what actually escaped) wins. It must rebind
+`signal-hook-function' to nil for its own extent: `backtrace' itself can
+signal internally (e.g. while formatting a value), and without that
+guard the hook re-enters itself on that inner signal and blows the C
+stack -- verified directly, this hung a whole session at 100% CPU until
+guarded."
+  (let* ((eh--captured-backtrace nil)
+         (signal-hook-function
+          (lambda (&rest _)
+            (let ((signal-hook-function nil))
+              (setq eh--captured-backtrace (with-output-to-string (backtrace)))))))
+    (condition-case err
+        (list :ok (eval form t))
+      (t (list :error err :backtrace (or eh--captured-backtrace ""))))))
 
 (defun eh--new-messages (mark)
   (if (not (get-buffer "*Messages*"))
@@ -409,9 +433,30 @@ face/display/read-only/invisible/the overlay set changes."
     (push end marks)
     (sort (delete-dups marks) #'<)))
 
+(defun eh-selected-buffer ()
+  "The buffer actually on screen: the selected window's buffer in the
+session's frame.  Deliberately *not* `current-buffer': `server.el'
+resets that to its own connection buffer around every separate
+`emacsclient --eval' call (§6.2), so a bare `(current-buffer)'/`(point)'
+evaluated by one `eh' invocation never reflects what an *earlier*,
+separate `eh' invocation left on screen -- only whatever happened to be
+current within that one RPC (verified directly: right after `find-file'
+switches to a fixture buffer, the very next, separate `eh eval' RPC
+reports server.el's own connection buffer as `current-buffer', even
+though the frame still correctly shows the fixture). This is what every
+buffer-less `eh' command (`eh snapshot' with no --buffer, `eh click
+--at-point') should resolve against instead, since those are commands
+DESIGN promises work without the caller naming a buffer."
+  (if (display-graphic-p)
+      (window-buffer (frame-selected-window (selected-frame)))
+    (current-buffer)))
+
+(defun eh-selected-point ()
+  (with-current-buffer (eh-selected-buffer) (point)))
+
 (cl-defun eh-snapshot (&key buffer window region props visible-only no-text images)
   "Structured, diffable description of a buffer or window.  See DESIGN §6.2."
-  (let* ((buf (if buffer (get-buffer buffer) (current-buffer))))
+  (let* ((buf (if buffer (get-buffer buffer) (eh-selected-buffer))))
     (unless buf (error "eh: no such buffer: %s" buffer))
     (with-current-buffer buf
       (let* ((win (get-buffer-window buf))
@@ -524,7 +569,11 @@ face/display/read-only/invisible/the overlay set changes."
   (eh-wait (lambda () (eval (read form-text) t)) timeout poll))
 
 (defun eh-wait-name (name &optional timeout poll)
-  (let ((cell (assoc name eh-waiters)))
+  "NAME may be a string, since it arrives that way from `ehd''s file-based
+eval protocol (§6.2 -- the CLI has no way to send a bare Lisp symbol) while
+`eh-waiters' is keyed by the symbols `eh-register-waiter' interned."
+  (let* ((name (if (stringp name) (intern name) name))
+         (cell (assq name eh-waiters)))
     (unless cell (error "eh: no such waiter: %s" name))
     (eh-wait (cdr cell) timeout poll)))
 

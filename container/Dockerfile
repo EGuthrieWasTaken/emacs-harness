@@ -21,6 +21,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     EH_SOCK=/run/eh/eh.sock \
     PATH=/opt/eh/bin:$PATH
 
+# The HTTP API (DESIGN §6.1, §14 phase 4 -- what the MCP server in
+# mcp-server/ talks to) is off by default; set EH_HTTP_ENABLE=1 plus
+# EH_HTTP_CLIENT_ID/EH_HTTP_CLIENT_SECRET at `docker run` time to turn it
+# on, and publish 8080 alongside 6080. It has no business being reachable
+# from the open internet directly -- put it behind the same Cloudflare
+# Tunnel + Access application pattern §10.2 already uses for the noVNC
+# view, on its own hostname.
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         emacs-gtk \
         xvfb openbox x11-utils x11-xserver-utils xdotool \
@@ -53,6 +61,8 @@ RUN chmod +x /opt/eh/bin/eh /opt/eh/ehd/ehd.py /opt/eh/ehd/ehd_cli.py \
              /usr/local/bin/ehd-cli /usr/local/bin/ehd-server \
              /opt/eh/container/entrypoint.sh /opt/eh/container/bootstrap-server.sh \
     && mkdir -p /run/eh /var/lib/eh/runs /var/lib/eh/elpa-cache /var/log/eh
+
+EXPOSE 6080 8080
 
 ENTRYPOINT ["/opt/eh/container/entrypoint.sh"]
 CMD ["server"]
