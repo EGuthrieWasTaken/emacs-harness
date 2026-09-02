@@ -153,10 +153,33 @@ def parse_region(vals):
     return [int(vals[0]), int(vals[1])]
 
 
+# Per-command timeout defaults, in seconds. `run' is the outlier and the
+# reason this table exists: it is the one command whose duration is a
+# whole test suite's, not one round trip's, and inheriting the 30s eval
+# default silently capped it. A profile of any size then died with
+# "cannot reach ehd: timed out" while the run was still going perfectly
+# well on the other side -- which reads as a broken harness rather than
+# as a timeout, and leaves the run's own artifacts behind unexplained.
+# `eh run smoke' fits in 30s, which is exactly why this went unnoticed.
+DEFAULT_TIMEOUTS = {"run": 1800, "video": 300}
+DEFAULT_TIMEOUT = 30
+
+
+def resolve_timeout(args) -> float:
+    """The timeout for this invocation: explicit --timeout, else the
+    command's own default."""
+    if getattr(args, "timeout", None) is not None:
+        return args.timeout
+    return DEFAULT_TIMEOUTS.get(args.command, DEFAULT_TIMEOUT)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eh")
     p.add_argument("--session", default=None)
-    p.add_argument("--timeout", type=float, default=30)
+    # Deliberately no default here: 30s is right for a single eval and
+    # absurd for a whole suite, so the default is resolved per command in
+    # `resolve_timeout' below. An explicit --timeout still wins everywhere.
+    p.add_argument("--timeout", type=float, default=None)
     p.add_argument("--json", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -328,7 +351,8 @@ def to_request(args) -> dict:
         # profile is a positional arg on `eh run`; ehd's session must already
         # target that profile (`eh session new --profile ...`), so fold it
         # into the session name convention when the caller didn't pass one.
-    return dict(cmd=cmd, session=args.session, args=a, timeout=args.timeout)
+    return dict(cmd=cmd, session=args.session, args=a,
+                timeout=resolve_timeout(args))
 
 
 def render(args, resp: dict) -> None:
@@ -386,7 +410,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     req = to_request(args)
-    resp = send_request(req, args.timeout)
+    resp = send_request(req, resolve_timeout(args))
     render(args, resp)
     return int(resp.get("exit_code", 0 if resp.get("ok") else 1))
 
