@@ -245,6 +245,12 @@ a harness change can never turn a package's CI red on its own.
 
 Two things worth doing on top:
 
+- **`eh run` gets a suite-sized timeout by default** (30 minutes), not
+  the 30 seconds a single `eh eval` gets. You should not need to think
+  about this — but if a very long profile ever does hit it, the symptom
+  is `cannot reach ehd: timed out` with exit code 5, which looks like a
+  broken harness rather than a timeout. Raise it with a *global*
+  `--timeout`, before the subcommand: `eh --timeout 3600 run mypkg`.
 - **`--shm-size=1gb` is not optional.** X servers use shared memory; the
   Docker default of 64MB is enough to make Xvfb fall over intermittently,
   which reads as a flaky test suite.
