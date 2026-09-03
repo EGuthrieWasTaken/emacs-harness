@@ -109,8 +109,13 @@ and find-file it there.  Never opens the read-only profile copy."
 ;;; ---------------------------------------------------------------------
 ;;; the scriptable fake backend (DESIGN 9.2)
 
-(defvar eh-fake-bridge "/opt/eh/bin/eh-fake-bridge"
-  "Path to the scriptable stand-in for a package's backend process.")
+(defvar eh-fake-bridge (if (boundp 'eh-bin-dir)
+                            (expand-file-name "eh-fake-bridge" eh-bin-dir)
+                          "/opt/eh/bin/eh-fake-bridge")
+  "Path to the scriptable stand-in for a package's backend process.
+Derived from `eh-bin-dir' (set by the generated per-session init file
+from the same EH_ROOT/EH_BIN_DIR ehd itself resolved), falling back to
+the container image path for direct `--eval'/`-l' loading.")
 
 (defun eh-fake-bridge-command (&rest args)
   "Command list running `eh-fake-bridge' with ARGS.
